@@ -359,6 +359,7 @@ DTO_FIELDS = {
         "idle_timeout_s",
         "timeout_s",
         "stall_retries",
+        "lease_timeout_s",
     ],
     "sparkrun.core.cluster_manager.ClusterDistributionConfig": ["model", "tuning"],
     "sparkrun.core.cluster_manager.ClusterDefinition": [

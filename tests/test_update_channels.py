@@ -372,7 +372,10 @@ def test_setup_install_alpha_uses_git_and_persists(monkeypatch, tmp_path):
         calls.append(cmd)
         return mock.Mock(returncode=0, stdout=str(tmp_path / "uv-tools") if cmd[1:3] == ["tool", "dir"] else "", stderr="")
 
-    with mock.patch("subprocess.run", side_effect=fake_run), mock.patch("sparkrun.cli._setup._commands.setup_completion", mock.MagicMock()):
+    with (
+        mock.patch("subprocess.run", side_effect=fake_run),
+        mock.patch("sparkrun.cli._setup._commands._install_completion", mock.MagicMock()),
+    ):
         result = CliRunner().invoke(main, ["setup", "install", "--alpha", "--no-update-registries", "--shell", "bash"])
     assert result.exit_code == 0, result.output
     installs = [c for c in calls if c[1:3] == ["tool", "install"]]

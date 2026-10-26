@@ -16,7 +16,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, cast
 import bisect
 
 from rich.segment import Segment
@@ -26,22 +26,28 @@ from textual.message import Message
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.actions import SkipAction
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.scrollbar import ScrollTo, ScrollUp
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
-from textual.widgets import Input, OptionList, Static
+from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from sparkrun.api import LogTarget, SparkrunError, open_log_target
 from sparkrun.cli._monitor_colorize import colorize_log_spans, unclaimed_ranges
+from sparkrun.cli._monitor_metrics import _spark_palette, render_metrics_footer
 from sparkrun.core.log_source import SCOPE_ALL, LogLine, LogSource, source_sort_key
 from sparkrun.core.monitoring import HostActivity, MonitorFrame
 from sparkrun.orchestration.job_metadata import load_job_metadata
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from rich.console import Console, ConsoleOptions
+
+    from sparkrun.cli._monitor_metrics import RuntimeMetricsScraper
 
 
 class LogScope(IntEnum):
@@ -168,10 +174,10 @@ def format_prefix(line: LogLine, multi_host: bool = False, multi_source: bool = 
     return f"[{'/'.join(parts)}]"
 
 
-#: Text.from_ansi() rewrites these characters as well as ESC sequences: bell and
-#: backspace erase, VT/FF/CR and FS-GS-RS become newlines, and NEL / U+2028 /
-#: U+2029 are str.splitlines() breaks it rejoins as \n. A line matching this
-#: pattern must take the full from_ansi path to stay equivalent.
+# Text.from_ansi() rewrites these characters as well as ESC sequences: bell and
+# backspace erase, VT/FF/CR and FS-GS-RS become newlines, and NEL / U+2028 /
+# U+2029 are str.splitlines() breaks it rejoins as \n. A line matching this
+# pattern must take the full from_ansi path to stay equivalent.
 _FROM_ANSI_NEEDED_RE = re.compile(r"[\x07\x08\x0b\x0c\r\x1b\x1c-\x1e\x85\u2028\u2029]")
 
 
@@ -689,12 +695,22 @@ class WorkloadList(OptionList):
             self.container = container
             self.scope = scope
 
+    class RequestStop(Message):
+        """Posted when stopping the highlighted workload is requested."""
+
+        def __init__(self, host: str, cluster_id: str, container: str) -> None:
+            super().__init__()
+            self.host = host
+            self.cluster_id = cluster_id
+            self.container = container
+
     class BackToHosts(Message):
         """Posted when user requests back navigation."""
 
     BINDINGS = [
         Binding("enter", "select_container", "Logs", priority=True),
         Binding("d", "dump_container", "Dump", priority=True),
+        Binding("k", "stop_workload", "Stop", priority=True),
         Binding("escape", "back_to_hosts", "Back", priority=True),
         Binding("q", "back_to_hosts", "Back", show=False, priority=True),
     ]
@@ -765,8 +781,32 @@ class WorkloadList(OptionList):
             return
         self.post_message(self.RequestDump(self.host, row.cluster_id, row.container, LogScope.CONTAINER))
 
+    def action_stop_workload(self) -> None:
+        if self.highlighted is None or not (0 <= self.highlighted < len(self._rows)):
+            return
+        row = self._rows[self.highlighted]
+        if row.is_header or not row.container:
+            return
+        self.post_message(self.RequestStop(self.host, row.cluster_id, row.container))
+
     def action_back_to_hosts(self) -> None:
         self.post_message(self.BackToHosts())
+
+
+def _wrapped_row_count(console: Console, opts: ConsoleOptions | None, plain: str) -> int:
+    """Rows *plain* occupies when wrapped at *opts*' width.
+
+    Measured from the plain characters, not the colorized renderable: wrapping
+    depends on the text alone, so building spans and Rich styles first is pure
+    overhead. The two agree exactly (verified over 4000 real SGLang lines at
+    width 78: 11452 rows either way).
+
+    An unmounted view has no console to wrap against and the line counts as one row,
+    which is what the map holds until the first real layout.
+    """
+    if opts is None:
+        return 1
+    return max(1, len(list(Segment.split_lines(console.render(Text(plain), opts)))))
 
 
 class LogView(ScrollView):
@@ -786,14 +826,18 @@ class LogView(ScrollView):
     class NearTop(Message):
         """Posted when scroll position comes within one page of top of loaded buffer."""
 
-    #: Max repaint rate while streaming (seconds). The gate is a rate limiter,
-    #: not a deferrer: the first paint after an idle gap fires immediately.
+    # Max repaint rate while streaming (seconds). The gate is a rate limiter,
+    # not a deferrer: the first paint after an idle gap fires immediately.
     STREAM_PAINT_INTERVAL: float = 0.1
 
-    #: Textual's WriterThread drains a bounded Queue(30) to the terminal; when it is
-    #: this full the terminal is slower than we emit and a blocking put() would soon
-    #: stall the whole event loop. Drop paints at that depth and retry with headroom.
+    # Textual's WriterThread drains a bounded Queue(30) to the terminal; when it is
+    # this full the terminal is slower than we emit and a blocking put() would soon
+    # stall the whole event loop. Drop paints at that depth and retry with headroom.
     WRITER_QUEUE_SATURATED: int = 24
+
+    # A width change re-measures every buffered line, so a resize drag rebuilds
+    # once the width settles instead of once per event.
+    WRAP_RESIZE_DEBOUNCE_S: float = 0.15
 
     def __init__(
         self,
@@ -821,8 +865,8 @@ class LogView(ScrollView):
         self.search_pattern: re.Pattern | str | None = search_pattern
         self.multi_host: bool = multi_host
         self.multi_source: bool = multi_source
-        #: The workload's runtime name when known, which selects its colorizer class;
-        #: None falls back to content sniffing (out-of-tree engines).
+        # The workload's runtime name when known, which selects its colorizer class;
+        # None falls back to content sniffing (out-of-tree engines).
         self.runtime: str | None = runtime
         self.current_match_entry: int | None = None
         self._stream_paint_at: float = 0.0
@@ -832,6 +876,9 @@ class LogView(ScrollView):
         self._wrap_map: list[tuple[int, int]] = []
         self._wrap_base: int = 0
         self._wrap_origin: int = 0
+        # Widget width the current wrap map was measured for; -1 means none yet.
+        self._wrap_for_width: int = -1
+        self._wrap_resize_timer: asyncio.TimerHandle | None = None
         self._max_width: int = 0
         if wrap:
             self.refresh_buffer()
@@ -851,6 +898,16 @@ class LogView(ScrollView):
         if self.virtual_size.height <= self.scrollable_content_region.height:
             return True
         return self.scroll_y >= self.max_scroll_y - 0.5
+
+    def watch_show_horizontal_scrollbar(self, shown: bool) -> None:
+        # Textual's own verdict on the bar (overflow-x: auto vs. virtual width),
+        # relayed to the pane, which trades the sparkline spacer for the bar's row.
+        # The pane settles the verdict before acting on it: it flips on
+        # intermediate layout passes.
+        parent = self.parent
+        schedule = getattr(parent, "_schedule_gap_update", None)
+        if callable(schedule):
+            schedule()
 
     def _rendered_plain_line(self, entry: LogLine | Marker) -> str:
         plain = entry_plain_text(entry) if isinstance(entry, LogLine) else entry.text
@@ -1056,7 +1113,6 @@ class LogView(ScrollView):
         if self.wrap:
             console = self.app.console if self.is_mounted else None
             opts = console.options.update_width(content_width) if console else None
-            pattern = self.search_pattern if self.highlight else None
             for i, entry in enumerate(entries):
                 idx = start_idx + i
                 stored = idx + self._wrap_base
@@ -1064,17 +1120,7 @@ class LogView(ScrollView):
                 if len(full_plain) <= content_width or not console:
                     self._wrap_map.append((stored, 0))
                 else:
-                    text = render_text(
-                        entry,
-                        color=self.color,
-                        pattern=pattern,
-                        multi_host=self.multi_host,
-                        multi_source=self.multi_source,
-                        runtime=self.runtime,
-                    )
-                    segs = list(console.render(text, opts))
-                    split = list(Segment.split_lines(segs))
-                    count = max(1, len(split))
+                    count = _wrapped_row_count(console, opts, full_plain)
                     for sub in range(count):
                         self._wrap_map.append((stored, sub))
             self._arm_stream_paint()
@@ -1087,8 +1133,16 @@ class LogView(ScrollView):
 
     def refresh_buffer(self) -> None:
         self._stream_paint_at = time.monotonic()
+        if self._wrap_resize_timer is not None:
+            self._wrap_resize_timer.cancel()
+            self._wrap_resize_timer = None
         content_width = self.scrollable_content_region.width or 80
         if self.wrap:
+            # A full rebuild is O(buffer) on the UI thread — measured 1.8 s at
+            # the 50k-line cap with ~170-char engine lines, 0.1 s at 2k. Width changes
+            # only (guarded and debounced in on_resize), so this is one pause per resize
+            # of a very old pane; chunk the build across ticks if that ever reads as a
+            # freeze.
             wrap_map: list[tuple[int, int]] = []
             console = self.app.console if self.is_mounted else None
             opts = console.options.update_width(content_width) if console else None
@@ -1098,23 +1152,14 @@ class LogView(ScrollView):
                 if len(full_plain) <= content_width or not console:
                     wrap_map.append((idx, 0))
                 else:
-                    text = render_text(
-                        entry,
-                        color=self.color,
-                        pattern=(self.search_pattern if self.highlight else None),
-                        multi_host=self.multi_host,
-                        multi_source=self.multi_source,
-                        runtime=self.runtime,
-                    )
-                    segs = list(console.render(text, opts))
-                    split = list(Segment.split_lines(segs))
-                    count = max(1, len(split))
+                    count = _wrapped_row_count(console, opts, full_plain)
                     for sub in range(count):
                         wrap_map.append((idx, sub))
             self._wrap_map = wrap_map
             self._wrap_base = 0
             self._wrap_origin = 0
             self.virtual_size = Size(content_width, len(wrap_map))
+            self._wrap_for_width = self.size.width
         else:
             max_w = 0
             for entry in self.buffer._entries:
@@ -1127,8 +1172,25 @@ class LogView(ScrollView):
         self.refresh()
 
     def on_resize(self, event: events.Resize) -> None:
-        if self.wrap:
+        # Only a width change can alter wrapping, and only once it settles: a drag
+        # fires many Resize events, and each rebuild re-measures the whole buffer.
+        if not self.wrap or event.size.width == self._wrap_for_width:
+            return
+        if self._wrap_resize_timer is not None:
+            self._wrap_resize_timer.cancel()
+        # Loop-level, like the stream paint timer: the widget's own pump may be
+        # busy while the pane drains flush messages, and this must still fire.
+        self._wrap_resize_timer = asyncio.get_running_loop().call_later(self.WRAP_RESIZE_DEBOUNCE_S, self._on_wrap_resize)
+
+    def _on_wrap_resize(self) -> None:
+        self._wrap_resize_timer = None
+        if self.is_mounted:
             self.refresh_buffer()
+
+    def on_unmount(self) -> None:
+        if self._wrap_resize_timer is not None:
+            self._wrap_resize_timer.cancel()
+            self._wrap_resize_timer = None
 
     def on_mount(self) -> None:
         self.refresh_buffer()
@@ -1348,6 +1410,8 @@ class LogPane(Vertical):
     LogPane > LogView {
         height: 1fr;
         width: 1fr;
+        /* A blank row always separates the view from the title above it. */
+        margin-top: 1;
     }
     LogPane > #log-search {
         height: 1;
@@ -1363,6 +1427,19 @@ class LogPane(Vertical):
         background: $surface;
         color: $text-muted;
         padding: 0 1;
+    }
+    LogPane > #log-metrics {
+        height: 1;
+        width: 1fr;
+        display: none;
+        background: $surface;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    /* The blank row above the sparkline row is dropped while the horizontal
+       scrollbar is up, and only then (toggled by LogPane._apply_gap_update). */
+    LogPane.spark-gap > #log-metrics {
+        margin-top: 1;
     }
     """
 
@@ -1444,8 +1521,13 @@ class LogPane(Vertical):
         self._incoming_cv: threading.Condition = threading.Condition(self._incoming_lock)
         self._incoming_lines: deque[tuple[LogLine, int]] = deque()
         self._flush_scheduled: bool = False
-
-        self.log_view: LogView = LogView(self.buffer, view_state=self.view_state)
+        self._gap_update_timer: asyncio.TimerHandle | None = None
+        # The sparkline spacer starts on: no scrollbar can be up before the first
+        # layout, and the settled verdict corrects this if one turns out to be.
+        self.add_class("spark-gap")
+        # Wrapping is the pane's default view: engine logs put the metric-bearing
+        # fields at the end of long lines, so an unwrapped tail hides them off-screen.
+        self.log_view: LogView = LogView(self.buffer, view_state=self.view_state, wrap=True)
 
     def _source_key(self, source: LogSource | LogLine | tuple[str, str]) -> tuple[str, str]:
         if isinstance(source, tuple):
@@ -1466,6 +1548,10 @@ class LogPane(Vertical):
         yield Static(id="log-title")
         yield self.log_view
         yield Input(id="log-search", placeholder="Regex search (enter to submit, esc to cancel)")
+        # The metrics row sits directly above the status/settings bar: the bar is
+        # the pane's fixed bottom edge (state, scope, wrap/color/highlight, match
+        # count), so a row that comes and goes belongs above it, not under it.
+        yield Static(id="log-metrics", markup=True)
         yield Static(id="log-status")
 
     def on_mount(self) -> None:
@@ -1473,6 +1559,46 @@ class LogPane(Vertical):
         self._update_status()
         self.log_view.focus()
         self._start_follow_worker(self.scope)
+
+    def on_resize(self, event: events.Resize) -> None:
+        # The pane's width is 0 until the first layout, and the footer has to
+        # re-fit after a resize; both land here.
+        self._refresh_metrics_footer()
+
+    def _schedule_gap_update(self) -> None:
+        """Re-read the bar verdict once the layout settles.
+
+        The verdict flips on intermediate layout passes — the first pass compares
+        a view width the vertical scrollbar has not been subtracted from yet and
+        reports a bar the next pass withdraws. Reacting to each pass would resize
+        the log view twice for nothing, so this waits out the settle like the
+        wrap-map rebuild does.
+        """
+        if self._gap_update_timer is not None:
+            self._gap_update_timer.cancel()
+        self._gap_update_timer = asyncio.get_running_loop().call_later(LogView.WRAP_RESIZE_DEBOUNCE_S, self._apply_gap_update)
+
+    def _apply_gap_update(self) -> None:
+        """Spend a blank row above the sparkline row.
+
+        Dropped while the horizontal scrollbar is up: with wrapping off the view
+        is already spending its width on the bar, and that row is the space
+        someone watching long lines wants back. The row below the title is not
+        part of this trade — it is always there (see the LogView rule). Textual's
+        own verdict on the bar drives this
+        (``LogView.watch_show_horizontal_scrollbar``), so the decision never
+        drifts from what is actually displayed.
+        """
+        self._gap_update_timer = None
+        if not self.is_mounted:
+            return
+        had_gap = "spark-gap" in self.classes
+        self.set_class(not self.log_view.show_horizontal_scrollbar, "spark-gap")
+        if ("spark-gap" in self.classes) != had_gap:
+            # The viewport just changed height under the view: a follower must not
+            # be left short of the tail with the stream idle, and the re-anchor has
+            # to land after the layout this class change schedules.
+            self.call_after_refresh(self.log_view.scroll_to_end)
 
     def _update_title(self) -> None:
         meta = load_job_metadata(self.cluster_id, cache_dir=self.cache_dir) or {}
@@ -1513,6 +1639,29 @@ class LogPane(Vertical):
         status_text = " | ".join(parts)
         status_widget = self.query_one("#log-status", Static)
         status_widget.update(status_text)
+
+    def _refresh_metrics_footer(self) -> None:
+        """Render the app tracker's latest sample for this pane's scope; hide without one."""
+        widget = self.query_one("#log-metrics", Static)
+        getter = cast("Callable[[str], RuntimeMetricsScraper] | None", getattr(self.app, "metrics_scraper_for", None))
+        scraper = getter(self.cluster_id) if getter is not None else None
+        if scraper is None:
+            widget.display = False
+            return
+        # Sparkline colors follow the active theme; a theme that lacks the
+        # variables yields an empty palette (sparks uncolored), not a crash.
+        palette: tuple[str, ...] = ()
+        try:
+            palette = _spark_palette(self.app.get_css_variables(), dark=self.app.current_theme.dark)
+        except Exception:  # noqa: BLE001 - cosmetic only; never break the stream path
+            palette = ()
+        sources = None if self.target is None else frozenset((s.host, s.container) for s in self.target.sources)
+        text = render_metrics_footer(scraper, palette, width=max(0, self.size.width - 2), sources=sources)
+        if text:
+            widget.update(text)
+            widget.display = True
+        else:
+            widget.display = False
 
     def _is_match_visible(self, match_entry: int) -> bool:
         scroll_y = int(self.log_view.scroll_offset[1])
@@ -1565,6 +1714,7 @@ class LogPane(Vertical):
             self._incoming_cv.notify_all()
         with self._delivered_lock:
             self._delivered_counts.clear()
+        self.query_one("#log-metrics", Static).display = False
         self._follow_worker(target_scope, self._cancel, self._generation)
 
     @work(thread=True, exclusive=True, group="follow")
@@ -1664,6 +1814,9 @@ class LogPane(Vertical):
         self.log_view.multi_host = multi_host
         self.log_view.multi_source = multi_source
         self.log_view.runtime = target.runtime or None
+        # History the background tracker already collected renders at once,
+        # filtered to this scope's sources.
+        self._refresh_metrics_footer()
 
     def _on_line(self, line: LogLine, gen: int, from_follow: bool = False) -> None:
         self._on_lines([line], gen, from_follow=from_follow)
@@ -2147,6 +2300,9 @@ class LogPane(Vertical):
         self.workers.cancel_group(self, "follow")
 
     def on_unmount(self) -> None:
+        if self._gap_update_timer is not None:
+            self._gap_update_timer.cancel()
+            self._gap_update_timer = None
         self.close()
 
 
@@ -2204,6 +2360,14 @@ class DumpLogScreen(ModalScreen[Any]):
     #dump-error {
         height: auto;
         color: $error;
+    }
+    #dump-buttons {
+        dock: bottom;
+        height: auto;
+        margin-top: 1;
+    }
+    #dump-buttons Button {
+        margin-right: 2;
     }
     """
 
@@ -2283,6 +2447,9 @@ class DumpLogScreen(ModalScreen[Any]):
                 id="dump-overwrite-list",
             )
             yield Static(id="dump-error")
+            with Horizontal(id="dump-buttons"):
+                yield Button("Cancel", id="dump-cancel")
+                yield Button("OK", id="dump-ok", variant="primary")
 
     def on_mount(self) -> None:
         if self._has_scope_list:
@@ -2327,25 +2494,39 @@ class DumpLogScreen(ModalScreen[Any]):
                 self.dismiss(None)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "dump-path-input":
+            self._submit_path(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "dump-cancel":
+            self.action_cancel()
+        elif event.button.id == "dump-ok":
+            self._submit_path(self.query_one("#dump-path-input", Input).value)
+
+    def _submit_path(self, value: str) -> None:
+        """Validate the path and start the dump (or ask before overwriting)."""
         if self._dumping:
             return
-        if event.input.id == "dump-path-input":
-            path_str = event.value.strip()
-            if not path_str:
-                self._set_error("File path cannot be empty")
-                return
-            resolved = os.path.abspath(os.path.expanduser(path_str))
-            parent = os.path.dirname(resolved)
-            if not os.path.isdir(parent):
-                self._set_error(f"Directory {parent!r} does not exist")
-                return
-            if not os.access(parent, os.W_OK):
-                self._set_error(f"Directory {parent!r} is not writable")
-                return
-            if os.path.exists(resolved):
-                self._prompt_overwrite(resolved)
-                return
-            self._start_dump(resolved, overwrite=False)
+        path_str = value.strip()
+        if not path_str:
+            self._set_error("File path cannot be empty")
+            return
+        resolved = os.path.abspath(os.path.expanduser(path_str))
+        parent = os.path.dirname(resolved)
+        if not os.path.isdir(parent):
+            self._set_error(f"Directory {parent!r} does not exist")
+            return
+        if not os.access(parent, os.W_OK):
+            self._set_error(f"Directory {parent!r} is not writable")
+            return
+        if self._pending_dump_path == resolved:
+            # A second OK (or Enter) on the overwrite prompt confirms it.
+            self._start_dump(resolved, overwrite=True)
+            return
+        if os.path.exists(resolved):
+            self._prompt_overwrite(resolved)
+            return
+        self._start_dump(resolved, overwrite=False)
 
     def _prompt_overwrite(self, resolved_path: str) -> None:
         self._pending_dump_path = resolved_path
@@ -2385,6 +2566,7 @@ class DumpLogScreen(ModalScreen[Any]):
         self._dumping = True
         try:
             self.query_one("#dump-path-input", Input).disabled = True
+            self.query_one("#dump-ok", Button).disabled = True
             if self._has_scope_list:
                 self.query_one("#dump-scope-list", OptionList).disabled = True
             overwrite_list = self.query_one("#dump-overwrite-list", OptionList)
@@ -2434,6 +2616,7 @@ class DumpLogScreen(ModalScreen[Any]):
                 try:
                     path_input = self.query_one("#dump-path-input", Input)
                     path_input.disabled = False
+                    self.query_one("#dump-ok", Button).disabled = False
                     if self._has_scope_list:
                         self.query_one("#dump-scope-list", OptionList).disabled = False
                     overwrite_list = self.query_one("#dump-overwrite-list", OptionList)
@@ -2445,3 +2628,77 @@ class DumpLogScreen(ModalScreen[Any]):
                 self._set_error(f"[red]{err_msg}[/red]")
 
             self.app.call_from_thread(_on_err, str(e))
+
+
+class StopWorkloadScreen(ModalScreen[bool]):
+    """Modal screen confirming a workload stop; dismisses True to confirm."""
+
+    DEFAULT_CSS = """
+    StopWorkloadScreen {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.6);
+    }
+    # A neutral elevated shade, not $panel: $panel carries the theme's accent
+    # tint and dims the body text. The buttons keep their own $surface fill,
+    # which stays visible against the neutral dialog.
+    #stop-dialog {
+        width: 60;
+        height: auto;
+        border: thick $warning;
+        background: $background-lighten-2;
+        padding: 1 2;
+    }
+    #stop-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #stop-buttons {
+        height: auto;
+        margin-top: 1;
+        align: center middle;
+    }
+    #stop-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        # The buttons are the whole interface: left/right (and up/down) move
+        # focus between them and enter/space activates the focused one. Escape
+        # and q still cancel without leaving the button row.
+        Binding("left", "app.focus_previous", "Previous", show=False, priority=True),
+        Binding("up", "app.focus_previous", "Previous", show=False, priority=True),
+        Binding("right", "app.focus_next", "Next", show=False, priority=True),
+        Binding("down", "app.focus_next", "Next", show=False, priority=True),
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("q", "cancel", "Cancel", show=False, priority=True),
+    ]
+
+    def __init__(self, host: str, cluster_id: str, container: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.host = host
+        self.cluster_id = cluster_id
+        self.container = container
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="stop-dialog"):
+            yield Static(f"Stop workload [bold]{self.cluster_id}[/bold]?", id="stop-title")
+            yield Static(f"Every container of the workload will be stopped (highlighted: {self.container} on {self.host}).")
+            with Horizontal(id="stop-buttons"):
+                yield Button("Cancel", id="stop-cancel")
+                yield Button("Stop", id="stop-confirm", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#stop-cancel", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "stop-confirm":
+            self.action_confirm()
+        elif event.button.id == "stop-cancel":
+            self.action_cancel()
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)

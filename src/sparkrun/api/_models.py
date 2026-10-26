@@ -575,6 +575,10 @@ class StopResult:
     retained so the workload can still be found and stopped."""
     dry_run: bool = False
     """True when nothing was torn down; the result previews the target."""
+    warnings: tuple[str, ...] = ()
+    """Problems that leave the workload stopped but its bookkeeping behind,
+    e.g. model cache claims that could not be released (see
+    ``model-cache reconcile``).  Not failures: :attr:`success` ignores them."""
 
     @property
     def success(self) -> bool:
@@ -672,10 +676,10 @@ class RecipeSummary:
     """
 
     name: str
-    """Qualified name — ``@registry/stem`` for a registry recipe, the bare
-    file stem for one discovered in the working directory."""
+    """Qualified catalog name: ``@registry/stem``, with the full relative
+    path when stems collide within that registry. Local recipes use the stem."""
     file: str
-    """File stem, i.e. the name that can be typed unqualified."""
+    """File stem (or format-defined name); use ``name`` to distinguish variants."""
     path: str
     model: str = ""
     runtime: str = ""

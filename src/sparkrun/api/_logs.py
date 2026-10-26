@@ -518,7 +518,15 @@ def open_log_target(
     )
     # Explicit selectors check only their sources. Reads never remove metadata
     # or cache claims, even when all selected containers are confirmed absent.
-    _verify_log_source_alive(executor, all_sources, ssh_kwargs, cluster_id, cache_dir, scope=effective_scope)
+    _verify_log_source_alive(
+        executor,
+        all_sources,
+        ssh_kwargs,
+        cluster_id,
+        cache_dir,
+        scope=effective_scope,
+        host_hardware=cluster_def.hosts_hardware or None,
+    )
 
     return LogTarget(
         workload_id=cluster_id,
@@ -556,7 +564,14 @@ def _filter_sources(sources, cluster_id, *, host=None, container=None, source_id
 
 
 def _verify_log_source_alive(
-    executor, sources, ssh_kwargs: dict, cluster_id: str, cache_dir: str | None, *, scope: str = SCOPE_HEAD
+    executor,
+    sources,
+    ssh_kwargs: dict,
+    cluster_id: str,
+    cache_dir: str | None,
+    *,
+    scope: str = SCOPE_HEAD,
+    host_hardware: dict | None = None,
 ) -> None:
     """Raise :class:`JobNotFound` if the workload isn't running.
 
@@ -596,7 +611,10 @@ def _verify_log_source_alive(
     # as `api.status`, `check_job_running`, and the monitor TUI.
     all_hosts = list(dict.fromkeys(s.host for s in sources))
     try:
-        snapshot = executor.query_status(all_hosts, ssh_kwargs=ssh_kwargs)
+        # The cluster's saved inventory, as ``api.status`` passes it: without
+        # it the executor falls back to ``resolve_hardware()``, which raises
+        # under a ``require-metadata`` profile and skips this check silently.
+        snapshot = executor.query_status(all_hosts, ssh_kwargs=ssh_kwargs, host_hardware=host_hardware)
     except Exception:  # noqa: BLE001 — best-effort; let log reader surface its own error
         return
 

@@ -7,8 +7,11 @@ Results in the tuning cache are reused by future ``sparkrun run`` invocations.
 
 from __future__ import annotations
 
+import logging
+import sys
 from pathlib import Path
 
+from sparkrun.core.progress import PROGRESS
 from sparkrun.tuning._common import (
     BaseTuner,
     DEFAULT_TP_SIZES,  # noqa: F401 — re-exported for public API
@@ -18,6 +21,9 @@ from sparkrun.tuning._common import (
     _get_tuning_volumes,
 )
 from sparkrun.utils.shell import quote
+from sparkrun.utils.text import excerpt
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -168,10 +174,27 @@ class SglangTuner(BaseTuner):
             " ".join(quote(arg) for arg in args),
             read_script("sglang_tune_fp8.py"),
         )
+        # A caller that does not own the terminal must capture rather than stream, since a
+        # streaming subprocess inherits fds 1/2 and paints over a Textual app. The monitor TUI
+        # pins root to WARNING and swaps sys.stdout. The gate is PROGRESS, not INFO: the CLI
+        # default is PROGRESS, and gating on INFO silenced a multi-hour tune at default verbosity.
+        quiet = not logging.getLogger().isEnabledFor(PROGRESS) or sys.stdout is not sys.__stdout__
         result = run_script_on_host_streaming(
-            self.host, script, ssh_kwargs=self.ssh_kwargs, timeout=resolve_tuning_timeout(self.timeout), dry_run=self.dry_run
+            self.host,
+            script,
+            ssh_kwargs=self.ssh_kwargs,
+            timeout=resolve_tuning_timeout(self.timeout),
+            dry_run=self.dry_run,
+            quiet=quiet,
         )
-        return 0 if self.dry_run else result.returncode
+        if self.dry_run:
+            return 0
+        if quiet and result.returncode != 0:
+            # Captured output is otherwise only DEBUG-logged, which leaves the failure unexplained.
+            for name, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+                if text and text.strip():
+                    logger.error("  FP8 tuning %s:\n%s", name, excerpt(text.rstrip(), 4000))
+        return result.returncode
 
     def _default_output_dir(self) -> Path:
         return get_sglang_tuning_dir()

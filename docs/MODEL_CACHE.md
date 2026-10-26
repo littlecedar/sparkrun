@@ -19,6 +19,7 @@ model_transfer_max_streams: 16         # total rsync processes per copy operatio
 model_transfer_idle_timeout_s: 600     # cancel a copy/download whose bytes stop advancing
 model_transfer_timeout_s: 0            # optional total ceiling; 0 (default) = none
 model_transfer_stall_retries: 1        # resume a stalled rsync this many times
+model_cache_lease_timeout_s: 86400     # wait this long for a busy cache lease; 0 = no limit
 # model_distribution_fallback: true   # optional override of provider policy
 ```
 
@@ -216,6 +217,11 @@ directory. For a pre-placed GGUF file, use
 `weight_path` to that filename. These inventories are checked before launch,
 including under the default policy; missing inventories produce an explicit unverified
 migration warning. Core does not acquire or repair pre-placed paths automatically.
+Without a manifest, local HF directories used by native vLLM, SGLang, Atlas and MAX still undergo
+basic config, index, shard and readability checks on every target. GGUF files use separate checks
+and need no `config.json`. Docker and local executors check the selected files through the workload's
+mounts and execution identity before replacement; images need no Python for that access check.
+These checks do not create a manifest, establish cross-node content identity, or validate weight hashes.
 
 ## Usage, retention and LRU cleanup
 
@@ -249,16 +255,23 @@ sparkrun model-cache list --hosts node1,node2 --cache-dir /models/hf --json
 
 # Preview LRU cleanup (the default); a byte budget applies per cache.
 sparkrun model-cache prune --hosts node1 --cache-dir /models/hf \
-  --min-age-days 7 --max-bytes 536870912000
+  --min-age-days 7 --max-bytes 500G
 
 # Explicitly apply the same policy. Nothing deletes automatically by default.
 sparkrun model-cache prune --hosts node1 --cache-dir /models/hf \
-  --min-age-days 7 --max-bytes 536870912000 --apply
+  --min-age-days 7 --max-bytes 500G --apply
 
-# Keep an immutable revision; use --remove to remove its retention pin.
-sparkrun model-cache pin org/model --revision FULL_COMMIT \
+# Keep a revision; use --remove to remove its retention pin. A ref such as
+# main resolves through each cache's own refs/, so caches may pin different commits.
+sparkrun model-cache pin org/model --revision main \
   --hosts node1 --cache-dir /models/hf
 ```
+
+`prune`, `adopt` and `reconcile` preview by default and change nothing without
+`--apply`; `prune --apply` does not ask again, so review the preview first.
+`delete` always previews, then asks for confirmation (`--yes` skips it,
+`--dry-run` stops after the preview). `repair` only adds files and runs unless
+given `--dry-run`.
 
 `prune` defaults to a dry run and a seven-day minimum age. Without a byte
 target it selects all eligible revisions older than that age. `--max-bytes`
@@ -298,18 +311,54 @@ Confirmed `stop`/`stop-all` releases the corresponding claims and restarts the
 retention age. A failed or interrupted activation retains its claims; neither
 age nor a dead controller proves that remote workloads stopped.
 
-Retry a normal stop to reconcile a known workload. If job metadata is missing,
-inspect **every host listed in the outstanding claim**, stop the workload and
-any in-flight launch, then explicitly release the exact claim shown by `list`:
+A relaunch under the same workload id (an `export systemd` unit restarting, or
+`run` again) keeps the earlier launch's claims in the job record. At the
+replacement barrier it releases them on every host where its status sweep, through
+the executor the earlier launch recorded, saw that workload not running; where it
+still runs, its containers are replaced by name without confirmation and the
+claim is kept for the next stop. `stop` also tears the id down on hosts that only
+an earlier launch claimed (the scheduler may have placed the relaunch elsewhere),
+which is a no-op where nothing runs. If a claim still cannot be released, `stop`
+succeeds with a warning naming `model-cache reconcile` and keeps the job record.
+
+Retry a normal stop to reconcile a known workload. Otherwise let sparkrun find
+the claims whose workload is gone (default cluster, or `--cluster`/`--hosts`):
 
 ```sh
-sparkrun model-cache reconcile org/model --revision FULL_COMMIT \
+sparkrun model-cache reconcile --all            # preview, every model
+sparkrun model-cache reconcile --all --apply    # release
+sparkrun model-cache reconcile org/model        # one model only
+```
+
+It sweeps the targets' status once and releases a claim only when every host in
+the claim was observed, its workload runs on none of them, no pending operation
+on this control machine names it, and it is older than `--min-age-minutes`
+(default 60) plus five minutes of allowance for clock skew: `created` is the
+clock of whichever control machine launched it, so even `--min-age-minutes 0`
+keeps a claim made in the last five minutes. Claims of another distribution's
+workloads (status cannot see them) are kept. A claim records the executor its
+launch used, and is kept unless the sweep queried that executor. A claim from an
+older sparkrun records none, and is kept while any executor on the cluster's
+substrate is turned off by a feature flag on this machine (another controller may
+have launched it through `local`, leaving no job record here); enable the flag
+named in the reason, for this run if need be (`SPARKRUN_FEATURE_EXECUTOR_LOCAL=1`),
+so the sweep covers it. The age floor covers a launch that has claimed its model but not
+yet started containers, possibly from another control machine; lower it only
+when nothing else is launching. Claims on unreachable hosts, or naming hosts
+outside the targets, are reported and kept.
+
+To release one claim by hand (`--claim`), inspect **every host listed in the outstanding
+claim**, stop the workload and any in-flight launch, then release the exact
+claim shown by `list`:
+
+```sh
+sparkrun model-cache reconcile org/model --revision FULL_COMMIT_OR_REF \
   --claim CLAIM_ID --hosts node1 --cache-dir /models/hf --confirm-inactive
 ```
 
 Reconciliation removes a protection record, not model files, and refreshes its
-retention age. The confirmation is an operator assertion; this command does
-not infer process inactivity. External applications and older Sparkrun
+retention age. For a single claim the confirmation is an operator assertion;
+that form does not infer process inactivity. External applications and older Sparkrun
 processes do not participate in these claims/locks: pin revisions they use,
 or leave automatic cleanup disabled on their shared caches.
 
@@ -319,11 +368,14 @@ Optional automatic cleanup runs before manifest-based model preparation:
 model_cache_prune:
   enabled: false                  # opt in explicitly
   min_age_days: 7
-  min_free_bytes: 107374182400     # 100 GiB free-space target per cache
-  # max_bytes: 536870912000       # optional 500 GiB private snapshot budget
+  min_free_bytes: 100G             # free-space target per cache
+  # max_bytes: 500G               # optional private snapshot budget (must be positive)
 ```
 
-Enabling it requires at least one byte target. It reuses the explicit prune
+Enabling it requires at least one byte target. Sizes take a plain byte count or
+a suffix: `K`/`M`/`G`/`T` (or `KiB`...`TiB`) are binary, `KB`/`MB`/`GB`/`TB`
+decimal, in any letter case. `prune --max-bytes` / `--min-free-bytes` take the
+same forms. It reuses the explicit prune
 implementation, excludes the repository being prepared, and retains pins and
 workload claims. It warns if protected content prevents meeting the target;
 this is not a guarantee that a subsequent download will fit. It does not run
@@ -335,7 +387,8 @@ Inventory and cleanup use Python 3 and standard filesystem tools on Linux cache
 hosts, through the existing SSH/host session. They never contact the model
 origin or install tools. Existing metadata inspection remains independent of
 this Python helper. CLI and daemon callers use the same Python API:
-`inventory_cache`, `prune_cache`, `pin_revision`, `reconcile_claim` and `adopt_cache`.
+`inventory_cache`, `prune_cache`, `pin_revision`, `reconcile_claim` and `adopt_cache`
+(`reconcile_claims`, behind `reconcile --all`, is Python/CLI only).
 The daemon exposes `model_cache.list`, `model_cache.prune`, `model_cache.pin`,
 `model_cache.reconcile` and `model_cache.adopt` (and matching `/v1/model_cache/...`
 routes). Prune, reconciliation and adoption require admin scope; prune and adopt
@@ -557,7 +610,27 @@ never deletes a shared canonical blob. Copied files are not skipped based only
 on equal sizes when a checksum repair has identified corruption.
 
 Core holds per-cache/repository `flock` leases across acquisition and provider
-calls. An operation nonce recognizes leases reached through shared-cache aliases;
+calls. Concurrent preparations wait for a busy lease, reporting the holder's
+controller, PID and operation every ten seconds, for up to
+`model_cache_lease_timeout_s` (cluster `distribution.model.lease_timeout_s`;
+default 86400, `0` waits without limit). Because a lease spans the holder's whole
+download, a healthy wait can last hours; the ceiling only fails a launch queued
+behind a holder that is stuck, and its error names the holder and the setting.
+Waiting remains cancellable and continues monitoring leases already acquired;
+failure to acquire is reported separately from losing a held lease.
+
+Preparation first locks and checks only its targets, including reuse of existing
+blobs. A warm launch, or a push whose head already holds the model, does not take
+an unused control-cache lease. If a control source is needed, preparation releases
+its target leases, reacquires the full set in order, and repeats validation and
+reuse to account for changes during the gap. Leases remain exclusive: transfers
+sharing a source still serialize, while an independent warm target can launch.
+Metadata writes, repairs, and eviction retain the same locking contract.
+
+An operation nonce recognizes leases reached through shared-cache aliases, both
+before locking and when an alias finds the lease busy and reads our own nonce as
+its holder. The holder writes the nonce through a separate, fsynced write, since
+NFS shows other clients only data the writer has flushed;
 complete aliases are omitted from transfer after observation. Core monitors the
 holder processes and treats lease loss as terminal: streaming commands are
 cancelled and providers receive cancellation through their request. Local Hub
@@ -590,6 +663,11 @@ remain errors. Env `launch.model_path` and
 `SPARKRUN_MODEL_PATH` (workload path, blank for controller post-commands) and the
 resolved `SPARKRUN_MODEL_REVISION`. Compilation/runtime caches remain separate
 and are not distributed with model payloads.
+
+For a resolved local model with no known revision, env `{launch.model_revision}` renders as `""`.
+Known revisions from validated manifests remain available. Missing model resolution is still an error;
+dry runs retain the explicit `<unresolved:launch.model_revision>` placeholder. An empty revision does
+not provide a distinct cache namespace for locally modified weights.
 
 Docker access checks run the selected image with its final UID and structured
 mounts, without GPU allocation or the image entrypoint. Local checks use the

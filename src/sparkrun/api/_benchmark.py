@@ -2007,7 +2007,13 @@ def _resume_locked(
 
     # Check if inference is currently running
     ssh_kwargs = build_ssh_kwargs(config)
-    job_status = check_job_running(cluster_id=state.cluster_id, hosts=hosts, ssh_kwargs=ssh_kwargs, cache_dir=cache_dir)
+    job_status = check_job_running(
+        cluster_id=state.cluster_id,
+        hosts=hosts,
+        ssh_kwargs=ssh_kwargs,
+        cache_dir=cache_dir,
+        host_hardware=cluster.hosts_hardware or None,
+    )
     if not job_status.running:
         raise NoResumableState(
             "inference cluster %r is not currently running.\n"

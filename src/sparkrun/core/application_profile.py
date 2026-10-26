@@ -14,6 +14,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 from sparkrun.utils.data import thaw as thaw
+from sparkrun.core.plugin_defaults import DefaultPlugin
 
 APPLICATION_PROFILE_API_VERSION = 1
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,47}\Z")
@@ -70,8 +71,22 @@ class ApplicationProfile:
     hardware_fallback: str = "require-metadata"
     # Importable profile reference propagated to child Python processes.
     profile_ref: str | None = None
+    # None selects Sparkrun's catalog; alternate applications default to none.
+    default_plugins: tuple[DefaultPlugin, ...] | None = ()
 
     def __post_init__(self):
+        if self.default_plugins is not None:
+            if not isinstance(self.default_plugins, (tuple, list)) or any(
+                not isinstance(entry, DefaultPlugin) for entry in self.default_plugins
+            ):
+                raise TypeError("default_plugins must be a sequence of DefaultPlugin entries")
+            for attr in ("name", "module"):
+                values = [getattr(entry, attr) for entry in self.default_plugins]
+                if len(values) != len(set(values)):
+                    raise ValueError("Duplicate default plugin %s" % attr)
+            object.__setattr__(self, "default_plugins", tuple(self.default_plugins))
+        elif self.id != "sparkrun":
+            raise ValueError("Alternate application profiles must declare their default plugin policy explicitly")
         for attr in ("id", "command", "config_namespace", "cache_namespace", "state_namespace", "resource_namespace"):
             value = getattr(self, attr)
             if attr.endswith("_namespace") and value == "":
@@ -170,6 +185,7 @@ SPARKRUN = ApplicationProfile(
     documentation_url="https://sparkrun.dev",
     support_url="https://github.com/spark-arena/sparkrun/issues",
     registries=None,
+    default_plugins=None,
     feature_channel=None,
     telemetry_enabled=True,
     telemetry_endpoint="https://telemetry.sparkrun.dev/",

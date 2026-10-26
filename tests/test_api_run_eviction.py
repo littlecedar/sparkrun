@@ -181,6 +181,49 @@ def test_mixed_snapshot_evicts_only_the_overlapping_sibling(cluster):
     assert [c["workload_id"] for c in calls] == [PRIOR]
 
 
+def test_intent_prefix_follows_the_application_resource_namespace(cluster):
+    """An application profile names its workloads under its own resource
+    namespace, so an unlabelled prior deployment is matched by that prefix,
+    not by a hardcoded ``sparkrun_``."""
+    from sparkrun.core.application_profile import ApplicationProfile, select_application_profile
+
+    select_application_profile(ApplicationProfile(id="jetsonrun", display_name="Jetsonrun", command="jetsonrun", package="jetsonrun"))
+    prior = "jetsonrun_%s_1111111111111111" % INTENT
+    status = _status(("h1", [_workload(prior, None)]))
+
+    evicted, _ = _evict(status, cluster, target_hosts=["h1"])
+
+    assert evicted == [prior]
+
+
+def test_status_query_carries_the_cluster_hardware_inventory():
+    """Eviction queries status with the cluster's saved inventory, like
+    ``api.status`` does; without it the executors fall back to
+    ``resolve_hardware()``, which raises under ``require-metadata``."""
+    from sparkrun.core.hardware import AcceleratorSpec, HostHardware
+
+    hw = HostHardware([AcceleratorSpec("nvidia", "jetson-orin", memory_gb=61.3)], source="detected")
+    cluster = ClusterDefinition(name="c", hosts=["h1"], hosts_hardware={"h1": hw})
+    queries: list[dict] = []
+
+    def _query(*args, **kwargs):
+        queries.append(kwargs)
+        return _status(("h1", []))
+
+    with patch("sparkrun.orchestration.executor.query_status_for_cluster", _query):
+        _evict_superseded_deployments(
+            intent_id=INTENT,
+            cluster_id_for_launch=NEW,
+            candidate_hosts=["h1"],
+            target_hosts=["h1"],
+            cluster_def=cluster,
+            config=None,
+            sctx=None,
+        )
+
+    assert queries[0]["host_hardware"] == {"h1": hw}
+
+
 # --------------------------------------------------------------------------
 # Best-effort semantics — never block the launch
 # --------------------------------------------------------------------------

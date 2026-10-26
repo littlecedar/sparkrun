@@ -158,16 +158,18 @@ def test_idle_timeout_requires_a_watch():
 
 @POSIX
 def test_real_stream_survives_past_idle_interval_while_advancing():
-    script = "for i in $(seq 1 12); do printf '\\r %d 1%% 1MB/s\\r' $((i * 100)); sleep 0.1; done\n"
+    # Runs ~3s against a 1s idle interval: well past it in total, while every
+    # gap (and the process start, on a loaded CI runner) stays well inside it.
+    script = "for i in $(seq 1 30); do printf '\\r %d 1%% 1MB/s\\r' $((i * 100)); sleep 0.1; done\n"
     watch = ProgressWatch()
     req = request()
     progress = CopyProgress(replace(req, feedback=None), {0: (req.targets[0], 10**6)})
     with ModelHostIO() as io:
         result = io.execute(
-            None, script, timeout=None, cancelled=lambda: False, stdout=progress.parser(0, watch), idle_timeout=0.5, watch=watch
+            None, script, timeout=None, cancelled=lambda: False, stdout=progress.parser(0, watch), idle_timeout=1.0, watch=watch
         )
     assert result.returncode == 0
-    assert watch.transferred == 1200
+    assert watch.transferred == 3000
 
 
 @POSIX

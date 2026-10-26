@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 SOURCE_IN_TREE = PluginSource.IN_TREE.value
 SOURCE_EXTERNAL = PluginSource.EXTERNAL.value
 SOURCE_INSTALLED = PluginSource.INSTALLED.value
+SOURCE_DEFAULT_MANAGED = PluginSource.DEFAULT_MANAGED.value
 
 #: ``version_source`` values (``None`` when the version is unknown).
 VERSION_FROM_MODULE = "module"
@@ -57,7 +58,7 @@ class PluginInfo:
     """Plugin name as the loader spells it (the module/subpackage name)."""
 
     source: str
-    """:data:`SOURCE_IN_TREE`, :data:`SOURCE_EXTERNAL`, or :data:`SOURCE_INSTALLED`."""
+    """The loading policy source, including :data:`SOURCE_DEFAULT_MANAGED`."""
 
     module: str
     """Dotted module name the loader imports."""
@@ -290,7 +291,7 @@ def list_plugins(config: "SparkrunConfig | None" = None, v: "Variables | None" =
 
 
 def _managed_plugins(config) -> list[PluginInfo]:
-    from sparkrun.core.managed_plugins import managed_enabled
+    from sparkrun.core.managed_plugins import managed_enabled, managed_source
     from sparkrun.core.plugin_store import PluginStore
     from sparkrun.core.external_plugins import loaded_plugin_module
 
@@ -306,7 +307,7 @@ def _managed_plugins(config) -> list[PluginInfo]:
         out.append(
             PluginInfo(
                 name=name,
-                source=SOURCE_EXTERNAL,
+                source=managed_source(record).value,
                 module=metadata["module"],
                 enabled=managed_enabled(record, config),
                 loaded=loaded,
@@ -317,7 +318,7 @@ def _managed_plugins(config) -> list[PluginInfo]:
                 package=metadata["distribution"],
                 selection_source="managed",
                 managed=True,
-                failure=plugin_load_failure((SOURCE_EXTERNAL, metadata["module"], str(path))),
+                failure=plugin_load_failure((managed_source(record).value, metadata["module"], str(path))),
                 management={
                     "metadata": metadata,
                     "source_url": record["source"].get("url"),
@@ -338,6 +339,7 @@ __all__ = [
     "SOURCE_EXTERNAL",
     "SOURCE_INSTALLED",
     "SOURCE_IN_TREE",
+    "SOURCE_DEFAULT_MANAGED",
     "VERSION_ATTR",
     "VERSION_FROM_DISTRIBUTION",
     "VERSION_FROM_MODULE",

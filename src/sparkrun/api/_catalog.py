@@ -389,7 +389,7 @@ def get_recipe_details(
         "source_kind": "imported" if imported else "registry" if registry else "local",
         "normalized_overrides": normalized,
         "reference": _reference(path, registry, sctx, imported=imported),
-        "name": recipe.qualified_name,
+        "name": sctx.registry_manager.catalog_recipe_name(registry, path) if registry else recipe.qualified_name,
         "source_path": str(path),
         "registry": registry.name if registry else None,
         "model": recipe.effective_served_model_name or recipe.model,

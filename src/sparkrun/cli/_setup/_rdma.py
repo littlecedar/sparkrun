@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from sparkrun.core.application_profile import render_identity_text
 
-import os
 import sys
 from dataclasses import asdict
 import textwrap
@@ -40,6 +39,7 @@ from sparkrun.api.setup._rdma import (
     available_suites,
     gated_suite_message,
 )
+from sparkrun.utils.env import resolve_ssh_user
 
 from . import setup
 from .._common import _get_context, resolve_host_context, dry_run_option, host_options, json_option, print_json
@@ -208,12 +208,7 @@ def _render(report) -> None:
 
     coverage = report.coverage
     if coverage.discovered:
-        basis = "%s topology" % coverage.topology if coverage.topology else "observed subnets; topology unspecified"
-        _echo_status(
-            coverage.status,
-            "Inventory coverage: %d host pair(s), %d candidate path(s) (%s)" % (coverage.pair_count, coverage.path_count, basis),
-            indent="",
-        )
+        _echo_status(coverage.status, _inventory_line(report), indent="")
         for issue in coverage.issues:
             _echo_status(issue.status, issue.detail)
         if coverage.status == STATUS_FAIL:
@@ -282,7 +277,9 @@ def _render(report) -> None:
         n = report.nccl
         label = "NCCL %s (%s) across %d host(s)" % (n.binary, n.msg_size, len(n.hosts))
         if n.sample is not None:
-            label += " — avg bus bandwidth %.2f GB/s" % n.sample.avg_bus_bw
+            # nccl-tests reports decimal GB/s; the Gb/s figure is what reads
+            # against the link rates the perftest lines above are graded on.
+            label += " — avg bus bandwidth %.2f GB/s (%.1f Gb/s)" % (n.sample.avg_bus_bw, n.sample.avg_bus_bw * 8)
         _echo_status(n.status, label, indent="  ")
         if n.detail and n.status in (STATUS_WARN, STATUS_FAIL):
             click.echo("         → %s" % n.detail)
@@ -292,6 +289,36 @@ def _render(report) -> None:
             for line in n.raw.strip().splitlines()[-15:]:
                 click.echo("    %s" % line)
         click.echo()
+
+
+def _plural(count: int, noun: str) -> str:
+    return "%d %s%s" % (count, noun, "" if count == 1 else "s")
+
+
+def _inventory_line(report) -> str:
+    """``X hosts reached on Y subnets (Z pairs, N paths; basis)``.
+
+    The pair and path counts alone read like a measurement, and under
+    ``--suite nccl`` nothing is measured pair by pair, so the line breaks the
+    numbers down to what discovery found: hosts with an RDMA path, the
+    subnets they share (a subnet with one host offers no path and is reported
+    on its own), and the pairs and paths those give.
+    """
+    coverage = report.coverage
+    total = len(report.hosts)
+    reached = total - len(coverage.uncovered_hosts)
+    hosts = _plural(reached, "host") if reached == total else "%d of %s" % (reached, _plural(total, "host"))
+    shared = sum(1 for members in coverage.subnets.values() if len(members) > 1)
+    basis = "%s topology" % coverage.topology if coverage.topology else "topology unspecified"
+    if report.suite == SUITE_NCCL:
+        basis += "; not measured by --suite nccl"
+    return "Inventory: %s reached on %s (%s, %s; %s)" % (
+        hosts,
+        _plural(shared, "subnet"),
+        _plural(coverage.pair_count, "pair"),
+        _plural(coverage.path_count, "path"),
+        basis,
+    )
 
 
 def _report_to_dict(report) -> dict:
@@ -349,6 +376,7 @@ def _report_to_dict(report) -> dict:
                 "status": report.nccl.status,
                 "detail": report.nccl.detail,
                 "avg_bus_bw_gbytes": report.nccl.sample.avg_bus_bw if report.nccl.sample else None,
+                "avg_bus_bw_gbits": report.nccl.sample.avg_bus_bw * 8 if report.nccl.sample else None,
             }
             if report.nccl is not None
             else None
@@ -361,7 +389,7 @@ _SUITES_AT_IMPORT = _suites_at_import()
 
 @setup.command("rdma-test", hidden=not _rdma_test_enabled_at_import(), help=_rdma_help(_SUITES_AT_IMPORT))
 @host_options
-@click.option("--user", "-u", default=None, help="SSH username (default: from config or current user)")
+@click.option("--user", "-u", default=None, help="SSH username (default: the cluster's user, then config, then current user)")
 @click.option(
     "--suite",
     type=_SuiteChoice(_SUITES_AT_IMPORT),
@@ -401,6 +429,12 @@ _SUITES_AT_IMPORT = _suites_at_import()
 )
 @click.option("--force-container", is_flag=True, help="Use the image even when perftest is on the host")
 @click.option("--keep-containers", is_flag=True, help="Leave test containers running for debugging")
+@click.option(
+    "--offline/--online",
+    "offline",
+    default=None,
+    help="Copy the test image only from where it already exists, with no internet access. --online overrides a cluster set to offline.",
+)
 @json_option(help="Emit the full results as JSON")
 @dry_run_option
 @click.pass_context
@@ -421,6 +455,7 @@ def setup_rdma_test(
     link_type,
     force_container,
     keep_containers,
+    offline,
     output_json,
     dry_run,
 ):
@@ -447,9 +482,13 @@ def setup_rdma_test(
 
     hctx = resolve_host_context(hosts, hosts_file, cluster_name, sctx.config, sctx=sctx)
     host_list = hctx.host_list
-    cluster = hctx.cluster_mgr.get(hctx.cluster_name) if hctx.cluster_name else None
-    ssh_kwargs = build_ssh_kwargs(sctx.config)
-    ssh_kwargs["ssh_user"] = user or sctx.config.ssh_user or os.environ.get("USER", "root")
+    cluster = hctx.cluster_def
+    # The same precedence a launch on this cluster connects with: an explicit
+    # --user, then the cluster's user:, then config, then the local login.
+    # Reading only config/$USER here SSH-ed as the wrong user on any cluster
+    # whose login differs from the control machine's.
+    ssh_kwargs = build_ssh_kwargs(sctx.config.for_cluster(cluster))
+    ssh_kwargs["ssh_user"] = user or resolve_ssh_user(cluster.user if cluster is not None else None, sctx.config)
 
     if len(host_list) < 2:
         raise click.ClickException(
@@ -486,6 +525,7 @@ def setup_rdma_test(
             link_type=None if link_type == "auto" else link_type,
             force_container=force_container,
             keep_containers=keep_containers,
+            offline=offline,
             dry_run=dry_run,
         )
     except api.setup.RdmaTestError as exc:

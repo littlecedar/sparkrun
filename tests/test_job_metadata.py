@@ -928,3 +928,30 @@ def test_save_job_metadata_records_the_callers_executor_layer(tmp_path: Path, mo
     other = _make_cluster_id("d", "3")
     save_job_metadata(other, mock_recipe, ["host-a"], cache_dir=str(tmp_path))
     assert "executor_overrides" not in load_job_metadata(other, cache_dir=str(tmp_path))
+
+
+def test_relaunch_under_the_same_cluster_id_keeps_earlier_cache_claims(tmp_path: Path, mock_recipe):
+    """A same-ID relaunch replaces containers without a stop; only this record can release the old claim."""
+    cluster_id = _make_cluster_id("e", "4")
+    ref = {"host": "host-a", "cache_root": "/hf", "repo": "org/m", "revision": "a" * 40}
+    first, second = {**ref, "claim": "first"}, {**ref, "claim": "second"}
+    save_job_metadata(cluster_id, mock_recipe, ["host-a"], cache_dir=str(tmp_path), model_cache_claims=[first])
+    save_job_metadata(cluster_id, mock_recipe, ["host-a"], cache_dir=str(tmp_path), model_cache_claims=[second, first])
+    assert load_job_metadata(cluster_id, cache_dir=str(tmp_path))["model_cache_claims"] == [first, second]
+
+    # A rewrite that names no claims (e.g. a plugin's own launch path) must not erase them either.
+    save_job_metadata(cluster_id, mock_recipe, ["host-a"], cache_dir=str(tmp_path))
+    assert load_job_metadata(cluster_id, cache_dir=str(tmp_path))["model_cache_claims"] == [first, second]
+
+
+def test_forget_model_cache_claims_keeps_the_rest_of_the_record(tmp_path: Path, mock_recipe):
+    from sparkrun.orchestration.job_metadata import forget_model_cache_claims
+
+    cluster_id = _make_cluster_id("f", "5")
+    first, second = {"claim": "a", "host": "host-a"}, {"claim": "b", "host": "host-b"}
+    save_job_metadata(cluster_id, mock_recipe, ["host-b"], cache_dir=str(tmp_path), model_cache_claims=[first, second])
+    forget_model_cache_claims(cluster_id, [first], cache_dir=str(tmp_path))
+    meta = load_job_metadata(cluster_id, cache_dir=str(tmp_path))
+    assert meta["model_cache_claims"] == [second] and meta["hosts"] == ["host-b"]
+    forget_model_cache_claims(cluster_id, [second], cache_dir=str(tmp_path))
+    assert "model_cache_claims" not in load_job_metadata(cluster_id, cache_dir=str(tmp_path))

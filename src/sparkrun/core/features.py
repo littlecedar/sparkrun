@@ -206,7 +206,11 @@ def is_feature_enabled(name: str, *, config=None, channel=None, env=None) -> boo
 
     for plugin, alias in LEGACY_PLUGIN_FLAGS.items():
         if name == alias:
-            return plugin_state(plugin, config, env=env, channel=channel).enabled
+            from sparkrun.core.plugin_identity import registered_plugin_by_id
+
+            identity = registered_plugin_by_id(plugin)
+            source = policy_source(identity.source[0]) if identity else "in-tree"
+            return plugin_state(plugin, config, source=source, env=env, channel=channel).enabled
     if name.startswith("gateway.") and not _raw_feature_enabled("gateway", config=config, channel=channel, env=env):
         return False
     owner = FEATURE_OWNERS.get(name) or DECLARED_FEATURE_OWNERS.get(name)

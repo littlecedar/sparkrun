@@ -9,7 +9,7 @@ shared unless noted below. The tables also cover pre-release plugin contracts.
 
 | Consumer | Supported surface |
 | --- | --- |
-| Application authors | `sparkrun.application`: `initialize`, `run_cli`, `ApplicationProfile`, `UpdateSource`, `APPLICATION_PROFILE_API_VERSION`, `child_environment`, and application/controller identity helpers. |
+| Application authors | `sparkrun.application`: `initialize`, `run_cli`, `ApplicationProfile`, `DefaultPlugin`, `UpdateSource`, `APPLICATION_PROFILE_API_VERSION`, `child_environment`, and application/controller identity helpers. |
 | Workload and benchmark callers | `sparkrun.api`: operation functions, options, results, decisions/events, operational errors, `resolve_sctx` / `default_sctx`, and the returned types listed under [stability tiers](#stability-tiers-and-returned-types). |
 | Catalog/front-end callers | `sparkrun.api`: catalog functions and `Catalog*` dictionary types; see the [headless catalog guide](CATALOG_API.md#browse-preview-and-retain). |
 | Setup callers | `sparkrun.api.setup`: SSH bootstrap/mesh, `rdma_test`, host-identity check/rotation, the `run_setup_steps` / `run_setup_undo` runners and their results, statuses, and `SetupFailed`. The planning internals it re-exports are **experimental** (see below). |

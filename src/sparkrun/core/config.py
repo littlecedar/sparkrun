@@ -299,6 +299,7 @@ class SparkrunConfig:
                 ("idle_timeout_s", "model_transfer_idle_timeout_s"),
                 ("timeout_s", "model_transfer_timeout_s"),
                 ("stall_retries", "model_transfer_stall_retries"),
+                ("lease_timeout_s", "model_cache_lease_timeout_s"),
             ):
                 value = getattr(prefs, field, None)
                 if value is not None:

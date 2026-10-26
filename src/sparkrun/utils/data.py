@@ -101,3 +101,31 @@ def byte_size_setting(value: object, *, key: str) -> int:
                 if result > 0 and result == int(result):
                     return int(result)
     raise ValueError("Configuration %r must be a positive byte count (for example 8589934592 or '8G')" % key)
+
+
+def parse_byte_size(value: object) -> int:
+    """Nonnegative byte count for a human-typed size: ``500G``, ``1.5TiB``, ``500GB``, ``1024``.
+
+    Case-insensitive. ``K``/``M``/``G``/``T`` and their ``iB`` forms are binary
+    (what ``format_bytes`` displays); ``KB``/``MB``/``GB``/``TB`` are decimal.
+    Unlike :func:`byte_size_setting`, letter case never changes the unit.
+    """
+    import re
+    from decimal import Decimal, InvalidOperation
+
+    if type(value) is int and value >= 0:
+        return value
+    if type(value) is float and value.is_integer() and value >= 0:
+        return int(value)
+    if isinstance(value, str):
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?)(i?b)?", value.strip().lower())
+        if match and not (match[3] and match[3].startswith("i") and not match[2]):
+            number, prefix, suffix = match.groups()
+            base = 1000 if suffix == "b" and prefix else 1024
+            try:
+                result = Decimal(number) * base ** ("kmgt".index(prefix) + 1 if prefix else 0)
+            except InvalidOperation:
+                result = None
+            if result is not None and result == int(result):
+                return int(result)
+    raise ValueError("%r is not a byte size (for example 500G, 1.5TiB, 500GB or 1073741824)" % (value,))

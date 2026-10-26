@@ -142,6 +142,23 @@ class TestRecipeSearch:
         assert "No recipes found" in result.output
 
 
+@pytest.mark.parametrize("command", ["list", "search"])
+def test_cli_preserves_disambiguated_recipe_variants(runner, registry_setup, command):
+    _, cache = registry_setup
+    for folder in ("3x-spark-cluster", "4x-spark-cluster"):
+        directory = cache / "test-registry" / "recipes" / folder
+        directory.mkdir()
+        (directory / "deepseek.yaml").write_text("model: org/deepseek\nruntime: sglang\ncontainer: test/image\n")
+    three = "@test-registry/3x-spark-cluster/deepseek"
+    four = "@test-registry/4x-spark-cluster/deepseek"
+    result = runner.invoke(main, ["recipe", command, "deepseek"])
+    assert result.exit_code == 0, result.output
+    assert three in result.output and four in result.output
+    narrowed = runner.invoke(main, ["recipe", command, "@test-registry/3x-spark-cluster/deepseek"])
+    assert narrowed.exit_code == 0, narrowed.output
+    assert three in narrowed.output and four not in narrowed.output
+
+
 @pytest.fixture
 def scoped_registry_setup(tmp_path: Path, monkeypatch):
     """Two enabled registries plus a disabled one, for @registry scope tests."""

@@ -57,30 +57,61 @@ def setup_completion(ctx, shell):
     else:
         rc_file = _shell_rc_file(shell)
 
-    completion_var = "_%s_COMPLETE" % get_application_profile().command.upper().replace("-", "_")
-
     # Resolve the absolute path to the installed `sparkrun` so the completion
     # snippet doesn't depend on PATH ordering in the shell rc file (issue #198).
     # shutil.which() returns what the shell itself resolves -- typically the
     # stable ~/.local/bin/sparkrun shim -- rather than an internal uv
     # version-specific venv path. Fall back to the bare command if unresolved.
-    from sparkrun.utils.shell import quote
     import shutil
 
-    sparkrun_cmd = quote(shutil.which(get_application_profile().command) or get_application_profile().command)
+    _install_completion(shell, rc_file, shutil.which(get_application_profile().command))
 
-    if shell == "bash":
-        snippet = 'eval "$(%s=bash_source %s)"' % (completion_var, sparkrun_cmd)
-    elif shell == "zsh":
-        snippet = 'eval "$(%s=zsh_source %s)"' % (completion_var, sparkrun_cmd)
+
+def _install_completion(shell, rc_file, executable, *, replace_existing=False):
+    """Install completion, optionally refreshing previously generated entries.
+
+    *executable* is embedded as given (quoted); ``None`` embeds the bare command.
+    Only callers with a persistent executable should replace existing entries;
+    the standalone completion command's PATH lookup may resolve into uvx's cache.
+    """
+    import shlex
+
+    from sparkrun.utils.shell import quote
+
+    completion_var = "_%s_COMPLETE" % get_application_profile().command.upper().replace("-", "_")
+    sparkrun_cmd = quote(str(executable) if executable else get_application_profile().command)
+
+    if shell in ("bash", "zsh"):
+        prefix, suffix = 'eval "$(%s=%s_source ' % (completion_var, shell), ')"'
     elif shell == "fish":
-        snippet = "%s=fish_source %s | source" % (completion_var, sparkrun_cmd)
+        prefix, suffix = "%s=fish_source " % completion_var, " | source"
     else:
         raise click.BadParameter("Unsupported shell: %s" % shell, param_hint="--shell")
+    snippet = prefix + sparkrun_cmd + suffix
 
-    # Check if already installed
     if rc_file.exists():
         contents = rc_file.read_text()
+        if replace_existing and executable:
+            lines = contents.splitlines(keepends=True)
+            for index, line in enumerate(lines):
+                stripped = line.strip()
+                if not (stripped.startswith(prefix) and stripped.endswith(suffix)):
+                    continue
+                old_command = stripped[len(prefix) : -len(suffix)]
+                try:
+                    words = shlex.split(old_command)
+                except ValueError:
+                    continue
+                # Match the exact single-executable form we generate. Leave
+                # custom arguments, expansions, and compound shell code alone.
+                if len(words) == 1 and quote(words[0]) == old_command:
+                    lines[index] = line.replace(stripped, snippet, 1)
+            updated = "".join(lines)
+            if updated != contents:
+                rc_file.write_text(updated)
+                click.echo("Completion updated for %s in %s" % (shell, rc_file))
+                click.echo("Restart your shell or run: source %s" % rc_file)
+                return
         if completion_var in contents:
             click.echo("Completion already configured in %s" % rc_file)
             return
@@ -179,8 +210,10 @@ def setup_install(ctx, shell, no_update_registries, stable, beta, alpha, yolo):
             rc_file.write_text("".join(cleaned))
             click.echo(f"Cleaned up old {get_application_profile().command} aliases from %s" % rc_file)
 
-    # Step 3: Install tab-completion
-    ctx.invoke(setup_completion, shell=shell)
+    # Step 3: Install tab-completion.  Embed the executable just installed, not
+    # the PATH lookup setup_completion does: under uvx the first `sparkrun` on
+    # PATH is uvx's throwaway environment in the uv cache.
+    _install_completion(shell, rc_file, environment_executable(target_prefix, get_application_profile().command), replace_existing=True)
 
     # Use the resulting environment, which may differ from a uvx caller.
     if not no_update_registries:

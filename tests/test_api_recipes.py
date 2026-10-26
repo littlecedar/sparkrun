@@ -142,6 +142,16 @@ class TestSearchRecipes:
         names = _names(search_recipes(runtime="sglang"))
         assert names == ["@community/community-only"]
 
+    def test_search_matches_inherited_metadata_description(self, catalog):
+        recipes = catalog / "community" / "recipes"
+        (recipes / "base.yaml").write_text(
+            "model: org/base\nruntime: sglang\nmetadata:\n  description: >-\n    Experimental engine\n    with RoCEnante.\n"
+        )
+        (recipes / "variant.yaml").write_text("include: base\nmodel: org/variant\n")
+        results = search_recipes("RoCEnante")
+        assert {r.name for r in results} == {"@community/base", "@community/variant"}
+        assert all(r.description == "Experimental engine with RoCEnante." for r in results)
+
 
 class TestRegistryScope:
     def test_scope_shorthand(self, catalog):
@@ -210,8 +220,7 @@ class TestUniqueNames:
     def test_same_stem_variants_within_a_registry_are_kept(self, catalog):
         """Sibling dirs holding same-stem variants are different recipes.
 
-        They share a qualified name (built from the file stem), so they must
-        not be mistaken for the same recipe surfacing twice.
+        Their catalog names include enough path context to select either one.
         """
         _write_recipe(catalog / "community" / "recipes" / "4x-cluster", "shared-recipe", model="Qwen/Qwen3-8B", min_nodes=4)
 
@@ -220,8 +229,8 @@ class TestUniqueNames:
         assert {r.min_nodes for r in results} == {2, 4}
         assert len({r.path for r in results}) == 2
 
-        # ...and `list`'s unambiguous-name view still collapses them.
-        assert len(search_recipes("shared-recipe", registry="community", unique_names=True)) == 1
+        assert {r.name for r in results} == {"@community/shared-recipe", "@community/4x-cluster/shared-recipe"}
+        assert len(search_recipes("shared-recipe", registry="community", unique_names=True)) == 2
 
 
 class TestLocalRecipes:

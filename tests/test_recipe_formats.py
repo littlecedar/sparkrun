@@ -169,6 +169,8 @@ def test_get_recipe_paths_leaves_foreign_registries_out(toy_registry, toy_format
 def test_qualified_name_uses_the_format(toy_registry, toy_format):
     mgr, toy_dir = toy_registry
     assert mgr.qualified_recipe_name("toyreg", toy_dir / "Alpha" / "toy.yaml") == "@toyreg/Alpha"
+    entry = mgr.get_registry("toyreg")
+    assert mgr.catalog_recipe_name(entry, toy_dir / "Alpha" / "toy.yaml") == "@toyreg/Alpha"
 
 
 def test_loading_translates_to_a_v2_recipe(toy_registry, toy_format):

@@ -84,6 +84,7 @@ class PluginManager:
         dry_run: bool = False,
         consent: Consent | None = None,
         legacy_consent: Consent | None = None,
+        _default=None,
     ) -> dict:
         from sparkrun.core.managed_plugins import check_collisions
 
@@ -101,6 +102,18 @@ class PluginManager:
             }
         with self.store.mutation() as (config, records, baseline):
             name = candidate.metadata.name
+            if _default is not None:
+                from sparkrun.core.plugin_defaults import default_plugins, default_skip_reason, validate_default_candidate
+
+                if _default not in default_plugins(config.profile):
+                    raise PluginError("Default plugin is not declared by this application")
+                validate_default_candidate(_default, candidate)
+                if selector is not None:
+                    raise PluginError("Default reconciliation cannot replace an installed plugin")
+                if name in records:
+                    return {"name": name, "status": "present"}
+                if reason := default_skip_reason(_default, config):
+                    return {"name": name, "status": "skipped", "reason": reason}
             previous = None
             if selector:
                 selected, previous = self.store.select(records, selector)
@@ -116,9 +129,11 @@ class PluginManager:
                 pinned = previous["source"].get("pinned_revision", previous["revision"])
                 if same_tag and pinned != candidate.revision:
                     raise PluginError("Pinned tag moved; existing installation unchanged")
-            external = self._consent(
-                candidate, previous, config, trust=trust, enable=enable, consent=consent, legacy_consent=legacy_consent
-            )
+            external = False
+            if _default is None:
+                external = self._consent(
+                    candidate, previous, config, trust=trust, enable=enable, consent=consent, legacy_consent=legacy_consent
+                )
             if previous and previous["revision"] == candidate.revision and previous["metadata"] == candidate.metadata.to_dict():
                 self.store.receipt(name, previous["active_generation"])
                 # Source tracking changes still persist; no duplicate generation.
@@ -132,7 +147,9 @@ class PluginManager:
                     "history_pruned": self.store.history_pruned,
                     "warning": warning,
                 }
-            validate_candidate(candidate.metadata, candidate.package_path, config.config_path)
+            default_managed = _default is not None or bool(previous and previous["trust"].get("default_managed") is True)
+            validation_options = {"default_managed": True} if default_managed else {}
+            validate_candidate(candidate.metadata, candidate.package_path, config.config_path, **validation_options)
             identifier, receipt = None, None
             if previous:
                 for old in previous["previous_generations"]:
@@ -152,6 +169,12 @@ class PluginManager:
                 "previous_generations": history,
                 "trust": {"granted": True, "scope": "source", "granted_at": datetime.now(timezone.utc).isoformat()},
             }
+            if default_managed:
+                records[name]["trust"]["default_managed"] = True
+            if previous is None and _default is None:
+                from sparkrun.core.plugin_defaults import suppress_default
+
+                suppress_default(config, name, False)
             features = deepcopy(config._data.get("features", {}))
             if not isinstance(features, dict):
                 features = {}
@@ -169,6 +192,7 @@ class PluginManager:
                 "package": str(candidate.package_path),
                 "metadata": candidate.metadata.to_dict(),
                 "declarations": candidate.metadata.declarations,
+                "default_managed": default_managed,
             }
             plan = run_hook(
                 config, name, details, "plugin.update" if previous else "plugin.install", previous=previous, current=records[name]
@@ -250,7 +274,8 @@ class PluginManager:
             metadata = PluginMetadata.from_dict(receipt["metadata"])
             self._compatible(metadata)
             package = self.store.generation_path(name, target) / "payload" / Path(*module_parts(metadata.module))
-            validate_candidate(metadata, package, config.config_path)
+            validation_options = {"default_managed": True} if record["trust"].get("default_managed") is True else {}
+            validate_candidate(metadata, package, config.config_path, **validation_options)
             previous = deepcopy(record)
             record.update(
                 metadata=receipt["metadata"],
@@ -266,6 +291,7 @@ class PluginManager:
                 "package": str(package),
                 "metadata": metadata.to_dict(),
                 "declarations": metadata.declarations,
+                "default_managed": record["trust"].get("default_managed") is True,
             }
             plan = run_hook(config, name, details, "plugin.rollback", previous=previous, current=record)
             apply_plan(config, plan)
@@ -303,6 +329,7 @@ class PluginManager:
                     "package": str(package),
                     "metadata": metadata.to_dict(),
                     "declarations": metadata.declarations,
+                    "default_managed": record["trust"].get("default_managed") is True,
                 }
                 plan = run_hook(config, name, details, "plugin.remove", previous=record)
                 apply_plan(config, plan)
@@ -310,6 +337,9 @@ class PluginManager:
             except PluginError as exc:
                 warning = "Removed without completing its hook: " + str(exc)
             del records[name]
+            from sparkrun.core.plugin_defaults import suppress_default
+
+            suppress_default(config, name, True)
             cleanup = self.store.commit(records, config, baseline)
             warning = warning or cleanup
             return {

@@ -458,6 +458,7 @@ def discover_cluster_id_by_intent(
         cluster_def,
         list(target_hosts),
         ssh_kwargs=ssh_kwargs,
+        host_hardware=cluster_def.hosts_hardware or None,
         config=config,
         v=sctx.variables if sctx is not None else None,
     )

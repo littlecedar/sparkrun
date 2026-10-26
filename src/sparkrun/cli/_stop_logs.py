@@ -137,6 +137,8 @@ def stop(ctx, target, hosts, hosts_file, cluster_name, stop_all, tp_override, po
     # containers may still be running.  Same contract as ``--all``.
     for line in result.errors:
         click.echo("Error: %s" % line, err=True)
+    for line in result.warnings:
+        click.echo("Warning: %s" % line, err=True)
     if not result.success:
         # Never claim a stop that didn't happen.  The exit code has said so
         # since 0.3.0, but a trailing "Workload stopped on N host(s)." said

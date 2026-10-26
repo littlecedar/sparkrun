@@ -26,6 +26,12 @@ _CONFIG: ContextVar[Any] = ContextVar("model_distribution_config", default=None)
 # Seconds without transferred bytes advancing before a copy is called stalled.
 DEFAULT_MODEL_TRANSFER_IDLE_TIMEOUT_S = 600
 DEFAULT_MODEL_TRANSFER_STALL_RETRIES = 1
+# How long a preparation waits for another one's repository lease. Leases are
+# held across acquisition, so a healthy wait can span someone else's whole
+# multi-hundred-GB download (450 GiB at 20 MiB/s is 6.4 hours), and several
+# launches may queue on one source. A day outlasts that while still failing a
+# boot-started or scripted launch queued behind a holder that is truly stuck.
+DEFAULT_MODEL_CACHE_LEASE_TIMEOUT_S = 24 * 3600
 # What a provider receives when no total ceiling is configured. Providers
 # predating the progress watchdog do arithmetic on request.timeout, so they
 # get a large finite value rather than None.
@@ -192,6 +198,19 @@ def transfer_timeouts(config=None) -> TransferTimeouts:
     if type(retries) is not int or retries < 0:
         raise ModelArtifactError("model_transfer_stall_retries must be a nonnegative integer")
     return TransferTimeouts(idle, total or None, retries)
+
+
+def lease_timeout(config=None) -> float | None:
+    """Seconds to wait for a busy model cache lease, or ``None`` for no limit.
+
+    ``model_cache_lease_timeout_s`` (cluster ``distribution.model.lease_timeout_s``),
+    default :data:`DEFAULT_MODEL_CACHE_LEASE_TIMEOUT_S`; ``0`` waits until cancelled.
+    """
+    config = _CONFIG.get() if config is None else config
+    value = _setting(config, "model_cache_lease_timeout_s", DEFAULT_MODEL_CACHE_LEASE_TIMEOUT_S)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ModelArtifactError("model_cache_lease_timeout_s must be a nonnegative number of seconds")
+    return value or None
 
 
 def validation_policy(config=None) -> str:

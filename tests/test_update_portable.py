@@ -92,7 +92,7 @@ def test_forced_install_from_uvx_honors_destination_worker_lease(monkeypatch, tm
             raise AssertionError(argv)
 
         args = ["setup", "install", "--alpha", "--no-update-registries", "--shell", "bash"]
-        with patch("subprocess.run", side_effect=run), patch.object(_commands, "setup_completion", Mock()):
+        with patch("subprocess.run", side_effect=run), patch.object(_commands, "_install_completion", Mock()):
             result = CliRunner().invoke(main, args)
             assert result.exit_code != 0
             assert "draining workers" in result.output
@@ -161,7 +161,7 @@ def test_post_install_registry_failure_is_nonfatal(monkeypatch, tmp_path):
             raise FileNotFoundError("entry point missing")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    with patch("subprocess.run", side_effect=run), patch.object(_commands, "setup_completion", Mock()):
+    with patch("subprocess.run", side_effect=run), patch.object(_commands, "_install_completion", Mock()):
         result = CliRunner().invoke(main, ["setup", "install", "--shell", "bash"])
     assert result.exit_code == 0, result.output
     assert "registry update failed or timed out (non-fatal)" in result.output

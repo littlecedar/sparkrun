@@ -258,7 +258,7 @@ def test_auto_prune_is_opt_in_and_excludes_the_requested_repository(tmp_path):
     manifest, current, _ = tracked(tmp_path)
     prepare_model("org/model", ["localhost"], cache_dir=str(tmp_path), manifest=manifest)
     assert old.exists()
-    config = {"model_cache_prune": {"enabled": True, "max_bytes": 0, "min_age_days": 0}}
+    config = {"model_cache_prune": {"enabled": True, "max_bytes": 1, "min_age_days": 0}}
     prepare_model("org/model", ["localhost"], cache_dir=str(tmp_path), manifest=manifest, config=config)
     assert current.exists() and not old.exists()
 
@@ -382,3 +382,318 @@ def test_cli_retention_preserves_custom_endpoint(monkeypatch, tmp_path, command,
     result = CliRunner().invoke(cli.model_cache, args)
     assert result.exit_code == 0, result.output
     assert mutation.call_args.args[0].endpoint == endpoint
+
+
+GONE = "sparkrun_" + "a" * 16 + "_" + "b" * 12
+LIVE = "sparkrun_" + "c" * 16 + "_" + "d" * 12
+
+
+def _claimed(root, workload, *, created=1.0):
+    """A tracked revision holding one activated claim of *workload* on localhost."""
+    manifest, _, path = tracked(root)
+    with usage_operation():
+        begin_workload(workload, {})
+        with ModelHostIO() as io:
+            record_use(io, "localhost", str(root), manifest)
+        token = workload_claims()[0]["claim"]
+        activate_workload()
+    record = json.loads(path.read_text())
+    record["claims"][token]["created"] = created
+    path.write_text(json.dumps(record))
+    return token, path
+
+
+def _sweep(monkeypatch, *, running=(), errors=None, pending=(), jobs=(), swept=("docker",), gated=None):
+    coverage = tuple(SimpleNamespace(target=SimpleNamespace(executor=name), status_scope="host") for name in swept)
+    monkeypatch.setattr("sparkrun.orchestration.executors._base._GATED_OFF_EXECUTORS", dict(gated or {}))
+    snapshot = SimpleNamespace(running_cluster_ids=lambda: tuple(running), observation_errors=dict(errors or {}), coverage=coverage)
+    records = [SimpleNamespace(workload_id=w, metadata={"executor": e}) for w, e in jobs]
+    monkeypatch.setattr("sparkrun.api._jobs.list_jobs", lambda **kw: records)
+    sweep = Mock(return_value=snapshot)
+    monkeypatch.setattr("sparkrun.api._status.status", sweep)
+    monkeypatch.setattr("sparkrun.core.pending_ops.list_pending_ops", lambda: [{"job_cluster_id": w} for w in pending])
+    return sweep
+
+
+def test_reconcile_all_previews_then_releases_an_orphaned_claim(tmp_path, monkeypatch):
+    token, path = _claimed(tmp_path, GONE)
+    sweep = _sweep(monkeypatch)
+
+    (preview,) = model_cache.reconcile_claims(cache_dir=str(tmp_path), cluster="lab")
+    assert (preview.claim, preview.workload, preview.status, preview.action) == (token, GONE, "orphaned", "would_release")
+    assert token in json.loads(path.read_text())["claims"]
+    assert sweep.call_args.kwargs["cluster"] == "lab"
+
+    (applied,) = model_cache.reconcile_claims(cache_dir=str(tmp_path), dry_run=False)
+    assert applied.action == "released"
+    assert json.loads(path.read_text())["claims"] == {}
+
+
+@pytest.mark.parametrize(
+    "sweep,created,status",
+    [
+        ({"running": [LIVE]}, 1.0, "running"),
+        ({"errors": {"localhost": "unreachable"}}, 1.0, "unverified"),
+        ({"pending": [LIVE]}, 1.0, "preparing"),
+        ({}, None, "recent"),
+        ({"jobs": [(LIVE, "local")]}, 1.0, "unverified"),
+        ({"jobs": [(GONE, "local")]}, 1.0, "unverified"),
+        ({"jobs": [(LIVE, "docker")]}, 1.0, "orphaned"),
+    ],
+)
+def test_reconcile_all_keeps_claims_it_cannot_prove_orphaned(tmp_path, monkeypatch, sweep, created, status):
+    import time
+
+    token, path = _claimed(tmp_path, LIVE, created=time.time() if created is None else created)
+    _sweep(monkeypatch, **sweep)
+    (result,) = model_cache.reconcile_claims(cache_dir=str(tmp_path), dry_run=False)
+    if status == "orphaned":
+        assert result.action == "released"
+        return
+    assert (result.status, result.action) == (status, None)
+    assert token in json.loads(path.read_text())["claims"]
+
+
+@pytest.mark.parametrize(
+    "workload,patch,status",
+    [
+        ("othername_" + "a" * 16 + "_" + "b" * 12, {}, "foreign"),
+        ("not-a-workload-id", {}, "foreign"),
+        (GONE, {"created": "yesterday"}, "unverified"),
+        (GONE, {"hosts": "localhost"}, "unverified"),
+    ],
+)
+def test_reconcile_all_keeps_foreign_and_malformed_claims(tmp_path, monkeypatch, workload, patch, status):
+    token, path = _claimed(tmp_path, workload)
+    record = json.loads(path.read_text())
+    record["claims"][token].update(patch)
+    path.write_text(json.dumps(record))
+    _sweep(monkeypatch)
+    (result,) = model_cache.reconcile_claims(cache_dir=str(tmp_path), dry_run=False)
+    assert (result.status, result.action) == (status, None)
+    assert token in json.loads(path.read_text())["claims"]
+
+
+@pytest.mark.parametrize(
+    "gated,status",
+    [
+        ({"local": ("executor.local", "host")}, "unverified"),
+        # Another substrate's executor cannot hold a workload on these hosts.
+        ({"k8s": ("executor.k8s", "k8s")}, "orphaned"),
+    ],
+)
+def test_reconcile_all_keeps_claims_an_executor_turned_off_here_could_hold(tmp_path, monkeypatch, gated, status):
+    # Another controller may have launched it under that executor, leaving no
+    # job record here, so the docker sweep finding nothing proves nothing.
+    token, path = _claimed(tmp_path, GONE)
+    _sweep(monkeypatch, gated=gated)
+    (result,) = model_cache.reconcile_claims(cache_dir=str(tmp_path), dry_run=False)
+    assert result.status == status
+    if status == "unverified":
+        assert "enable executor.local" in result.reason
+        assert token in json.loads(path.read_text())["claims"]
+
+
+def _record_executor(path, token, executor):
+    record = json.loads(path.read_text())
+    record["claims"][token]["executor"] = executor
+    path.write_text(json.dumps(record))
+
+
+def test_reconcile_all_requires_the_claims_recorded_executor_in_the_sweep(tmp_path, monkeypatch):
+    token, path = _claimed(tmp_path, GONE)
+    _record_executor(path, token, "local")
+    _sweep(monkeypatch)
+    (result,) = model_cache.reconcile_claims(cache_dir=str(tmp_path), dry_run=False)
+    assert (result.status, result.action) == ("unverified", None)
+    assert "local" in result.reason
+    assert token in json.loads(path.read_text())["claims"]
+
+
+def test_reconcile_all_releases_a_recorded_swept_executor_despite_gated_peers(tmp_path, monkeypatch):
+    # The claim says where its workload ran, so an unrelated gated executor
+    # no longer has to block it.
+    token, path = _claimed(tmp_path, GONE)
+    _record_executor(path, token, "docker")
+    _sweep(monkeypatch, gated={"local": ("executor.local", "host")})
+    (result,) = model_cache.reconcile_claims(cache_dir=str(tmp_path), dry_run=False)
+    assert (result.status, result.action) == ("orphaned", "released")
+
+
+@pytest.mark.parametrize(("jobs", "status"), [([(GONE, "docker")], "orphaned"), ([(GONE, None)], "unverified"), ([], "unverified")])
+def test_reconcile_all_lets_a_job_record_place_a_legacy_claim(tmp_path, monkeypatch, jobs, status):
+    # Claims written before they recorded an executor would otherwise all stay
+    # unverified on stable, where executor.local is gated off by default.
+    token, path = _claimed(tmp_path, GONE)
+    _sweep(monkeypatch, jobs=jobs, gated={"local": ("executor.local", "host")})
+    (result,) = model_cache.reconcile_claims(cache_dir=str(tmp_path), dry_run=False)
+    assert result.status == status
+    assert (token in json.loads(path.read_text())["claims"]) is (status != "orphaned")
+
+
+def test_launch_claims_record_their_executor(tmp_path):
+    from sparkrun.models.usage import set_workload_executor
+
+    manifest, _, path = tracked(tmp_path)
+    with usage_operation():
+        begin_workload(GONE, {})
+        set_workload_executor("local")
+        with ModelHostIO() as io:
+            record_use(io, "localhost", str(tmp_path), manifest)
+        token = workload_claims()[0]["claim"]
+        activate_workload()
+    assert json.loads(path.read_text())["claims"][token]["executor"] == "local"
+
+
+def test_gated_off_executor_registration_is_recorded(monkeypatch):
+    from sparkrun.orchestration.executors import _base
+
+    class Gated(_base.Executor):
+        executor_name = "gated-test"
+        required_feature_flag = "executor.gated-test"
+
+    monkeypatch.setattr(_base, "_GATED_OFF_EXECUTORS", {})
+    monkeypatch.setattr(Gated, "is_multi_extension", lambda self, v: False)
+    Gated.on_registration(Gated.__new__(Gated), None)
+    assert _base.gated_off_executors() == {"gated-test": ("executor.gated-test", "host")}
+    monkeypatch.setattr(Gated, "is_multi_extension", lambda self, v: True)
+    Gated.on_registration(Gated.__new__(Gated), None)
+    assert _base.gated_off_executors() == {}
+
+
+def test_reconcile_all_skips_the_status_sweep_without_claims(tmp_path, monkeypatch):
+    tracked(tmp_path)
+    sweep = _sweep(monkeypatch)
+    assert model_cache.reconcile_claims(cache_dir=str(tmp_path)) == ()
+    sweep.assert_not_called()
+
+
+def test_cli_reconcile_all_forwards_cluster_scope_and_age(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+    from sparkrun.cli import _model_cache as cli
+
+    monkeypatch.setattr(cli, "_get_context", lambda ctx: cli_context())
+    monkeypatch.setattr(cli, "_resolve_targets", lambda sctx, **kw: (["h1"], "/hf", "Cluster: lab — 1 host(s)", "lab"))
+    reconcile = Mock(return_value=())
+    monkeypatch.setattr(model_cache, "reconcile_claims", reconcile)
+    result = CliRunner().invoke(cli.model_cache, ["reconcile", "org/model", "--apply", "--min-age-minutes", "5"])
+    assert result.exit_code == 0, result.output
+    assert "No outstanding workload claims." in result.output
+    kwargs = reconcile.call_args.kwargs
+    assert (kwargs["cluster"], kwargs["repo"], kwargs["dry_run"], kwargs["min_age_seconds"], kwargs["hosts"]) == (
+        "lab",
+        "org/model",
+        False,
+        300,
+        ("h1",),
+    )
+
+
+@pytest.mark.parametrize(
+    "args,message",
+    [
+        ([], "Name a MODEL to reconcile, or pass --all."),
+        (["--all", "org/model"], "Name a MODEL to reconcile, or pass --all."),
+        (["org/model", "--revision", SHA], "apply only with --claim"),
+        (["--all", "--endpoint", "https://mirror.example"], "apply only with --claim"),
+        (["--all", "--claim", "x"], "--claim releases one claim"),
+        (["org/model", "--revision", SHA, "--claim", "x", "--confirm-inactive", "--apply"], "--claim releases one claim"),
+        (["org/model", "--claim", "x", "--confirm-inactive"], "--claim needs MODEL and --revision."),
+    ],
+)
+def test_cli_reconcile_rejects_mixed_modes(args, message):
+    from click.testing import CliRunner
+    from sparkrun.cli import _model_cache as cli
+
+    result = CliRunner().invoke(cli.model_cache, ["reconcile", *args])
+    assert result.exit_code != 0
+    assert message in result.output
+
+
+def test_pin_and_reconcile_accept_a_cached_ref(tmp_path):
+    tracked(tmp_path)
+    refs = tmp_path / "hub" / "models--org--model" / "refs"
+    refs.mkdir(parents=True, exist_ok=True)
+    (refs / "main").write_text(SHA)
+    (report,) = model_cache.pin_revision(ModelArtifactRequest("org/model", "main"), cache_dir=str(tmp_path))
+    assert [(e.revision, e.pinned) for e in report.entries if e.action] == [(SHA, True)]
+
+    with pytest.raises(ModelArtifactError, match="no cached ref 'dev'"):
+        model_cache.pin_revision(ModelArtifactRequest("org/model", "dev"), cache_dir=str(tmp_path))
+    with pytest.raises(ModelArtifactError, match="ref name"):
+        model_cache.pin_revision(ModelArtifactRequest("org/model", "../main"), cache_dir=str(tmp_path))
+
+    token, _ = _claimed(tmp_path, GONE)
+    model_cache.reconcile_claim(ModelArtifactRequest("org/model", "main"), cache_dir=str(tmp_path), claim=token, confirm_inactive=True)
+    assert model_cache.inventory_cache(cache_dir=str(tmp_path))[0].entries[0].claims == {}
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("500G", 500 * 2**30), ("500gib", 500 * 2**30), ("500GB", 500 * 10**9), ("1.5T", 3 * 2**39), ("1024", 1024), (0, 0), (1e3, 1000)],
+)
+def test_byte_sizes_parse_case_insensitively(value, expected):
+    from sparkrun.utils.data import parse_byte_size
+
+    assert parse_byte_size(value) == expected
+
+
+@pytest.mark.parametrize("value", ["1.5", "12x", "GiB", "-1G", -1, True, 1.5])
+def test_byte_sizes_reject_ambiguous_or_fractional_input(value):
+    from sparkrun.utils.data import parse_byte_size
+
+    with pytest.raises(ValueError):
+        parse_byte_size(value)
+
+
+def test_cli_prune_takes_sizes_and_echoes_the_target(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+    from sparkrun.cli import _model_cache as cli
+
+    monkeypatch.setattr(cli, "_get_context", lambda ctx: cli_context())
+    prune = Mock(return_value=())
+    monkeypatch.setattr(model_cache, "prune_cache", prune)
+    result = CliRunner().invoke(
+        cli.model_cache, ["prune", "--cache-dir", str(tmp_path), "--max-bytes", "500G", "--min-free-bytes", "100GB"]
+    )
+    assert result.exit_code == 0, result.output
+    assert (prune.call_args.kwargs["max_bytes"], prune.call_args.kwargs["min_free_bytes"]) == (500 * 2**30, 100 * 10**9)
+    assert "Target: managed snapshots <= 500.0 GiB; free space >= 93.1 GiB" in result.output
+    bad = CliRunner().invoke(cli.model_cache, ["prune", "--cache-dir", str(tmp_path), "--max-bytes", "lots"])
+    assert bad.exit_code == 2 and "is not a byte size" in bad.output
+
+
+def test_auto_prune_config_accepts_sizes(monkeypatch):
+    from sparkrun.models import cache
+
+    calls = []
+    monkeypatch.setattr(cache, "host_cache", lambda io, host, root, **kw: calls.append(kw) or {"reclaimed_bytes": 0, "target_met": True})
+    policy = {"model_cache_prune": {"enabled": True, "max_bytes": "1T"}}
+    cache.auto_prune(
+        None, [("h1", "/hf")], config=SimpleNamespace(get=lambda key, default=None: policy.get(key, default)), exclude_repos=()
+    )
+    assert calls[0]["max_bytes"] == 2**40 and calls[0]["min_free_bytes"] is None
+
+
+@pytest.mark.parametrize("value", [0, "0", "0G"])
+def test_auto_prune_config_rejects_a_zero_budget(monkeypatch, value):
+    from sparkrun.models import cache
+
+    host_cache = Mock()
+    monkeypatch.setattr(cache, "host_cache", host_cache)
+    policy = {"model_cache_prune": {"enabled": True, "max_bytes": value}}
+    with pytest.raises(ModelArtifactError, match="max_bytes must be positive"):
+        cache.auto_prune(
+            None, [("h1", "/hf")], config=SimpleNamespace(get=lambda key, default=None: policy.get(key, default)), exclude_repos=()
+        )
+    host_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("action,force", [("inventory", False), ("delete", True)])
+def test_claimed_revisions_point_at_reconcile(tmp_path, action, force):
+    from sparkrun.utils.cli_formatters import format_model_cache_reports
+
+    _claimed(tmp_path, GONE)
+    text = format_model_cache_reports(model_cache.inventory_cache(cache_dir=str(tmp_path)), action=action)
+    assert "model-cache reconcile org/model` (a preview; add --apply)" in text
+    assert ("--force" in text) == force

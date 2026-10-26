@@ -7,6 +7,7 @@ from pathlib import Path
 
 from sparkrun.models.artifacts import ModelArtifactError
 from sparkrun.models.host_io import ModelHostIO
+from sparkrun.utils.data import parse_byte_size
 from sparkrun.utils.shell import quote
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,17 @@ def auto_prune(io, locations, *, config, exclude_repos):
         raise ModelArtifactError("unknown model_cache_prune settings: " + ", ".join(sorted(unknown)))
     if policy.get("max_bytes") is None and policy.get("min_free_bytes") is None:
         raise ModelArtifactError("automatic cache pruning requires max_bytes or min_free_bytes")
+    sizes = {}
+    for key in ("max_bytes", "min_free_bytes"):
+        if policy.get(key) is not None:
+            try:
+                sizes[key] = parse_byte_size(policy[key])
+            except ValueError as exc:
+                raise ModelArtifactError("model_cache_prune.%s: %s" % (key, exc)) from exc
+    if sizes.get("max_bytes") == 0:
+        # A zero budget is met only by an empty cache, so every launch would
+        # evict every eligible revision: far more likely a typo than a policy.
+        raise ModelArtifactError("model_cache_prune.max_bytes must be positive; to stop pruning set enabled: false")
     from sparkrun.feedback import get_feedback
 
     for host, root in locations:
@@ -119,8 +131,8 @@ def auto_prune(io, locations, *, config, exclude_repos):
             action="prune",
             dry_run=False,
             min_age_seconds=age_seconds(policy.get("min_age_days", 7)),
-            max_bytes=policy.get("max_bytes"),
-            min_free_bytes=policy.get("min_free_bytes"),
+            max_bytes=sizes.get("max_bytes"),
+            min_free_bytes=sizes.get("min_free_bytes"),
             exclude_repos=exclude_repos,
         )
         if report["reclaimed_bytes"]:

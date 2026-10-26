@@ -161,6 +161,10 @@ def registered_plugin_identity(module_name):
     return next((identity for identity in _IDENTITIES.values() if identity.module == module_name), None)
 
 
+def registered_plugin_by_id(plugin_id):
+    return _IDENTITIES.get(normalize_plugin_id(plugin_id))
+
+
 def clear_plugin_identities():
     """Test isolation, matching clear_loaded_plugin_modules."""
     _IDENTITIES.clear()

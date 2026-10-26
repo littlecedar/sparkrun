@@ -67,6 +67,20 @@ def init_sparkrun(v: Variables | None = None, log_level: str = "WARNING", *, pro
             raise RuntimeError("Application is already initialized; Variables can only be supplied on first initialization")
         return _variables
 
+    from sparkrun.core.managed_plugins import validating_candidate
+    from sparkrun.core.plugin_defaults import reconcile_default_plugins
+
+    if not validating_candidate():
+        try:
+            results = reconcile_default_plugins(config if config is not None else config_module.SparkrunConfig(config_path))
+            if config is not None and any(result["status"] == "installed" for result in results):
+                config._load()  # Installation hooks may have committed plugin-owned settings.
+            for result in results:
+                if result["status"] == "failed":
+                    logger.warning("Cannot install default plugin %s: %s", result["name"], result["error"])
+        except (ValueError, OSError) as exc:
+            logger.warning("Cannot reconcile default plugins: %s", exc)
+
     if v is None:
         from scitrera_app_framework import init_framework_desktop
 

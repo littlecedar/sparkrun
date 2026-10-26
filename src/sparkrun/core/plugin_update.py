@@ -20,6 +20,10 @@ def reconcile_plugins(config, *, update: bool = True) -> dict:
     if update:
         with manager.store.mutation():
             pass
+    from sparkrun.core.plugin_defaults import reconcile_default_plugins
+
+    defaults = reconcile_default_plugins(config, manager=manager) if update else []
+    installed = {row["name"]: row for row in defaults if row["status"] == "installed"}
     inventory = list_plugins(config)
     for plugin in inventory:
         before = evaluate_plugin_compatibility(metadata_for_plugin(plugin), host)
@@ -31,7 +35,9 @@ def reconcile_plugins(config, *, update: bool = True) -> dict:
             "compatibility": before.to_dict(),
             "outcome": "unmanaged" if not plugin.managed else "availability unchecked",
         }
-        if update and plugin.managed and host.core_version:
+        if plugin.name in installed:
+            row.update(update=installed[plugin.name], outcome="installed")
+        elif update and plugin.managed and host.core_version:
             try:
                 result = manager.update(plugin.name, automatic=True)
                 row["update"] = result
@@ -42,7 +48,7 @@ def reconcile_plugins(config, *, update: bool = True) -> dict:
             except (PluginError, OSError) as exc:
                 row.update(outcome="failed", error=str(exc))
         rows.append(row)
-    report = {"protocol": 1, "host": host.identity(), "update_plugins": update, "plugins": rows}
+    report = {"protocol": 1, "host": host.identity(), "update_plugins": update, "plugins": rows, "defaults": defaults}
     if requested_update and not update:
         report["warning"] = "Plugin compatibility audit incomplete: host core identity is unknown; no repairs attempted"
     if update:

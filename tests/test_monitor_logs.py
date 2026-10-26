@@ -12,8 +12,9 @@ from typing import Any, Iterator, Sequence
 import pytest
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.color import Color
 from textual.geometry import Size
-from textual.widgets import Input, OptionList, Static
+from textual.widgets import Button, Input, OptionList, Static
 
 from sparkrun.api._errors import SparkrunError
 from sparkrun.cli._monitor_logs import (
@@ -31,6 +32,7 @@ from sparkrun.cli._monitor_logs import (
     ViewState,
     WorkloadList,
     DumpLogScreen,
+    StopWorkloadScreen,
     canonical_scope,
     default_dump_path,
     distinct_scopes,
@@ -43,6 +45,7 @@ from sparkrun.cli._monitor_logs import (
     workload_scope_summary,
     _trim_page_drift,
 )
+from sparkrun.cli._monitor_metrics import RuntimeMetricsScraper
 from sparkrun.core.cluster_status import ContainerDetail, RunningWorkload
 from sparkrun.core.monitoring import HostActivity, MonitorFrame
 from sparkrun.orchestration.logs import LogLine, LogSource
@@ -337,8 +340,8 @@ def test_render_text_colorizes_tensorfold_lines():
         # (message after the prefix, spans that must be present, styles that must not appear)
         (
             "serving nemotron at http://127.0.0.1:8080/v1 (sampling: greedy; drafts: on; context: 262144; loaded in 1.2s)",
-            [("http://127.0.0.1:8080/v1", "underline blue"), ("1.2s", "yellow")],
-            ("red", "green"),
+            [("http://127.0.0.1:8080/v1", "underline blue"), ("1.2s", "yellow"), ("serving", "green")],
+            ("red",),
         ),
         ("done req-8f3a2c1e prompt=100 tokens=200 tok/s=100.0 ttft=0.10s", [("done", "green"), ("req-8f3a2c1e", "magenta")], ("red",)),
         ("warning: non-loopback server has no API key; requests are open", [("warning:", "yellow")], ("red", "green")),
@@ -1597,6 +1600,11 @@ class _LogPaneTestApp(App):
         self.pane = pane
         self.closed = False
         self.dump_request = None
+        # Stands in for the app-level background tracker the pane reads from.
+        self.metrics_scraper = RuntimeMetricsScraper()
+
+    def metrics_scraper_for(self, cluster_id: str) -> RuntimeMetricsScraper:
+        return self.metrics_scraper
 
     def compose(self) -> ComposeResult:
         yield self.pane
@@ -1614,6 +1622,7 @@ class _WorkloadListTestApp(App):
         self.wl = wl
         self.opened_log = None
         self.dump_request = None
+        self.stop_request = None
         self.backed_to_hosts = False
 
     def compose(self) -> ComposeResult:
@@ -1624,6 +1633,9 @@ class _WorkloadListTestApp(App):
 
     def on_workload_list_request_dump(self, event: WorkloadList.RequestDump) -> None:
         self.dump_request = (event.host, event.cluster_id, event.container, event.scope)
+
+    def on_workload_list_request_stop(self, event: WorkloadList.RequestStop) -> None:
+        self.stop_request = (event.host, event.cluster_id, event.container)
 
     def on_workload_list_back_to_hosts(self, event: WorkloadList.BackToHosts) -> None:
         self.backed_to_hosts = True
@@ -1731,7 +1743,7 @@ def test_log_pane_follow_and_controls(monkeypatch):
             assert "1 container c1" in status
             assert "color on" in status
             assert "highlight on" in status
-            assert "wrap off" in status
+            assert "wrap on" in status  # the pane opens wrapped
 
             # Color toggle 'c'
             await pilot.press("c")
@@ -1747,9 +1759,9 @@ def test_log_pane_follow_and_controls(monkeypatch):
 
             # Wrap toggle 'l'
             await pilot.press("l")
-            assert pane.log_view.wrap is True
+            assert pane.log_view.wrap is False
             status = str(pane.query_one("#log-status", Static).content)
-            assert "wrap on" in status
+            assert "wrap off" in status
 
             # Search with '/'
             await pilot.press("slash")
@@ -2035,6 +2047,42 @@ def test_workload_list_pilot():
     asyncio.run(_run())
 
 
+def test_workload_list_k_requests_stop():
+    import asyncio
+
+    rows = [
+        WorkloadRow(key="header:cid1", text="cid1", is_header=True, cluster_id="cid1"),
+        WorkloadRow(key="cid1:c1", text="  c1", is_header=False, cluster_id="cid1", container="c1"),
+        WorkloadRow(key="cid1:c2", text="  c2", is_header=False, cluster_id="cid1", container="c2"),
+    ]
+    wl = WorkloadList(host="h1", rows=rows)
+    app = _WorkloadListTestApp(wl)
+
+    async def _run():
+        async with app.run_test() as pilot:
+            assert wl.highlighted == 1  # first container row highlighted by default
+            await pilot.press("down")
+            await pilot.press("k")
+            assert app.stop_request == ("h1", "cid1", "c2")
+
+    asyncio.run(_run())
+
+
+def test_workload_list_k_ignores_header_only_rows():
+    import asyncio
+
+    rows = [WorkloadRow(key="empty", text="No workloads", is_header=True)]
+    wl = WorkloadList(host="h1", rows=rows)
+    app = _WorkloadListTestApp(wl)
+
+    async def _run():
+        async with app.run_test() as pilot:
+            await pilot.press("k")
+            assert app.stop_request is None
+
+    asyncio.run(_run())
+
+
 def test_workload_list_mouse_click_selects():
     import asyncio
 
@@ -2166,9 +2214,7 @@ def test_log_pane_wrapped_search_navigation_and_input(monkeypatch):
         app = _LogPaneTestApp(pane)
         async with app.run_test(size=(80, 20)) as pilot:
             await pilot.pause(0.1)
-            # Toggle wrap on
-            await pilot.press("l")
-            assert pane.log_view.wrap is True
+            assert pane.log_view.wrap is True  # wrapped by default; search runs in wrap mode
 
             # Open search input and type pattern
             await pilot.press("slash")
@@ -2373,6 +2419,78 @@ def test_log_pane_wrapped_page_anchoring(monkeypatch):
             anchor_entry = pane.log_view.virtual_row_to_entry(int(pane.log_view.scroll_y))
             assert anchor_entry == 83
             assert pane.buffer[anchor_entry].text == "tail 2"
+
+    asyncio.run(_run())
+
+
+def test_log_pane_opens_with_wrapping_enabled(monkeypatch):
+    """A fresh pane wraps without any keypress: long engine lines stay readable."""
+    import asyncio
+
+    long_line = "INFO 10-17 08:12:34 [loggers.py:331] Engine 000: Avg prompt throughput: 123.4 tokens/s" + (" tail-marker" * 12)
+    target = FakeLogTarget(lines=[LogLine(host="h1", container="c1", text=long_line)])
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+
+    async def _run():
+        pane = LogPane(host="h1", cluster_id="cid1", container="c1", scope=LogScope.CONTAINER)
+        app = _LogPaneTestApp(pane)
+        async with app.run_test(size=(80, 20)) as pilot:
+            await pilot.pause(0.15)
+            view = pane.log_view
+            assert view.wrap is True  # default, no 'l' pressed
+            assert "wrap on" in str(pane.query_one("#log-status", Static).content)
+
+            # One long line occupies several virtual rows, and the overflow is
+            # rendered rather than clipped off the right edge.
+            assert view.virtual_size.height > len(pane.buffer)
+            rows = ["".join(seg.text for seg in view.render_line(y)) for y in range(view.virtual_size.height)]
+            assert any("tail-marker" in row for row in rows)
+
+    asyncio.run(_run())
+
+
+def test_log_view_rebuilds_wrap_map_once_per_settled_width(monkeypatch):
+    """A width drag costs one rebuild; a height-only resize costs none."""
+    import asyncio
+    from textual import events as tevents
+    from textual.geometry import Size as TSize
+
+    target = FakeLogTarget(lines=[LogLine(host="h1", container="c1", text="x" * 300)])
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+
+    async def _run():
+        pane = LogPane(host="h1", cluster_id="cid1", container="c1", scope=LogScope.CONTAINER)
+        app = _LogPaneTestApp(pane)
+        async with app.run_test(size=(80, 20)) as pilot:
+            await pilot.pause(0.15)
+            view = pane.log_view
+            # The mount-time width change armed a debounce of its own; let it land
+            # before counting, or it is measured as a rebuild this test did not cause.
+            for _ in range(50):
+                if view._wrap_resize_timer is None:
+                    break
+                await asyncio.sleep(0.01)
+            calls: list[int] = []
+            real = view.refresh_buffer
+
+            def counted():
+                calls.append(1)
+                real()
+
+            monkeypatch.setattr(view, "refresh_buffer", counted)
+            width, height = view.size.width, view.size.height
+            view._wrap_for_width = width  # the map already matches this width
+
+            for size in (TSize(width, height), TSize(width, height + 3)):
+                view.on_resize(tevents.Resize(size, TSize(width, height)))
+            await pilot.pause(0.25)
+            assert calls == []  # same width, and height alone cannot change wrapping
+
+            for w in (90, 96, 100, 104):  # a drag: many events, one settled width
+                view.on_resize(tevents.Resize(TSize(w, height), TSize(width, height)))
+            assert calls == []
+            await pilot.pause(0.3)
+            assert len(calls) == 1
 
     asyncio.run(_run())
 
@@ -3037,6 +3155,172 @@ class _DumpModalTestApp(App):
         self.result = res
 
 
+class _StopModalTestApp(App):
+    def __init__(self, screen: StopWorkloadScreen, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.modal = screen
+        self.result = None
+
+    def on_mount(self) -> None:
+        self.push_screen(self.modal, callback=self._on_result)
+
+    def _on_result(self, res: Any) -> None:
+        self.result = res
+
+
+def test_stop_modal_arrow_keys_move_between_buttons():
+    import asyncio
+
+    async def _run():
+        app = _StopModalTestApp(StopWorkloadScreen(host="h1", cluster_id="cid1", container="c1"))
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            cancel = app.modal.query_one("#stop-cancel")
+            confirm = app.modal.query_one("#stop-confirm")
+            assert app.focused is cancel
+
+            # The y/n shortcuts are gone: the button row is the whole interface.
+            await pilot.press("y")
+            await pilot.pause(0.05)
+            assert app.result is None
+            assert isinstance(app.screen, StopWorkloadScreen)
+
+            await pilot.press("right")
+            await pilot.pause(0.05)
+            assert app.focused is confirm
+            await pilot.press("enter")
+            await pilot.pause(0.05)
+            assert app.result is True
+
+        # Left/up walk back, so the row is navigable in both directions.
+        app = _StopModalTestApp(StopWorkloadScreen(host="h1", cluster_id="cid1", container="c1"))
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            await pilot.press("right")
+            await pilot.pause(0.05)
+            assert app.focused is app.modal.query_one("#stop-confirm")
+            await pilot.press("left")
+            await pilot.pause(0.05)
+            assert app.focused is app.modal.query_one("#stop-cancel")
+
+    asyncio.run(_run())
+
+
+def test_stop_modal_buttons_confirm_and_cancel():
+    import asyncio
+
+    async def _run():
+        # Cancel is focused on open, so a stray enter cancels rather than stops.
+        app = _StopModalTestApp(StopWorkloadScreen(host="h1", cluster_id="cid1", container="c1"))
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            assert app.focused is app.modal.query_one("#stop-cancel")
+            await pilot.press("enter")
+            await pilot.pause(0.05)
+            assert app.result is False
+
+        # Mouse paths: the buttons dismiss with the same verdict as the keys.
+        app = _StopModalTestApp(StopWorkloadScreen(host="h1", cluster_id="cid1", container="c1"))
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            await pilot.click("#stop-cancel")
+            await pilot.pause(0.05)
+            assert app.result is False
+
+        app = _StopModalTestApp(StopWorkloadScreen(host="h1", cluster_id="cid1", container="c1"))
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            await pilot.click("#stop-confirm")
+            await pilot.pause(0.05)
+            assert app.result is True
+
+        # Keyboard activation of the Stop button.
+        app = _StopModalTestApp(StopWorkloadScreen(host="h1", cluster_id="cid1", container="c1"))
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            app.modal.query_one("#stop-confirm").focus()
+            await pilot.press("enter")
+            await pilot.pause(0.05)
+            assert app.result is True
+
+    asyncio.run(_run())
+
+
+def _relative_luminance(color: Color) -> float:
+    def channel(value: int) -> float:
+        c = value / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    return 0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+
+
+def _contrast_ratio(a: Color, b: Color) -> float:
+    hi, lo = sorted((_relative_luminance(a), _relative_luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_stop_modal_cancel_button_contrasts_with_the_dialog():
+    import asyncio
+
+    async def _run():
+        app = _StopModalTestApp(StopWorkloadScreen(host="h1", cluster_id="cid1", container="c1"))
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            dialog = app.modal.query_one("#stop-dialog")
+            cancel = app.modal.query_one("#stop-cancel")
+            background = dialog.styles.background
+            # The dialog sits on a neutral elevated shade: readable against the
+            # theme foreground, and distinct from the buttons' own $surface fill.
+            assert background == Color.parse(app.theme_variables["background-lighten-2"])
+            assert background != Color.parse(app.theme_variables["panel"])
+            assert background != cancel.styles.background
+            assert _contrast_ratio(background, Color.parse(app.theme_variables["foreground"])) >= 7.0
+
+    asyncio.run(_run())
+
+
+def test_stop_modal_buttons_are_centered_in_the_dialog():
+    import asyncio
+
+    async def _run():
+        for size in ((120, 40), (80, 24)):
+            app = _StopModalTestApp(StopWorkloadScreen(host="h1", cluster_id="cid1", container="c1"))
+            async with app.run_test(size=size) as pilot:
+                await pilot.pause(0.05)
+                dialog = app.modal.query_one("#stop-dialog")
+                row = app.modal.query_one("#stop-buttons")
+                cancel = app.modal.query_one("#stop-cancel")
+                confirm = app.modal.query_one("#stop-confirm")
+
+                for button, label in ((cancel, "Cancel"), (confirm, "Stop")):
+                    assert dialog.region.contains_region(button.region), size
+                    # Wide enough for the whole label, no ellipsis.
+                    assert button.size.width >= len(label), size
+                assert cancel.region.right <= confirm.region.x, size
+
+                left_gap = cancel.region.x - row.region.x
+                right_gap = row.region.right - confirm.region.right
+                assert abs(left_gap - right_gap) <= 2, (size, left_gap, right_gap)
+
+    asyncio.run(_run())
+
+
+def test_stop_modal_cancel_keys():
+    import asyncio
+
+    async def _run():
+        for key in ("escape", "q"):
+            app = _StopModalTestApp(StopWorkloadScreen(host="h1", cluster_id="cid1", container="c1"))
+            async with app.run_test() as pilot:
+                await pilot.pause(0.05)
+                await pilot.press(key)
+                await pilot.pause(0.05)
+                assert app.result is False
+                assert not isinstance(app.screen, StopWorkloadScreen)
+
+    asyncio.run(_run())
+
+
 def test_dump_modal_single_distinct_scope(tmp_path, monkeypatch):
     import asyncio
     import os
@@ -3305,6 +3589,90 @@ def test_dump_modal_directory_error_display():
             assert app.result is None
 
     asyncio.run(_run())
+
+
+def test_dump_modal_ok_reenabled_after_worker_error(tmp_path, monkeypatch):
+    import asyncio
+
+    out_file = tmp_path / "recovered.log"
+    target = FakeLogTarget(lines=[LogLine(host="h1", container="c1", text="after error")])
+    calls = {"count": 0}
+
+    def _open(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise SparkrunError("transport went away")
+        return target
+
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", _open)
+    summary = ScopeSummary(node_containers=1, cluster_containers=1, cluster_hosts=1)
+
+    async def _run():
+        screen = DumpLogScreen(host="h1", cluster_id="cid1", container="c1", summary=summary)
+        app = _DumpModalTestApp(screen)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            ok = screen.query_one("#dump-ok", Button)
+            screen.query_one("#dump-path-input", Input).value = str(out_file)
+            await pilot.click("#dump-ok")
+            for _ in range(40):
+                if not screen._dumping and "transport went away" in str(screen.query_one("#dump-error", Static).content):
+                    break
+                await pilot.pause(0.05)
+            assert "transport went away" in str(screen.query_one("#dump-error", Static).content)
+            # A failed dump must not leave OK dead: the corrected path starts
+            # through the same button. The short pause lets the re-enable settle
+            # before the click is dispatched.
+            assert ok.disabled is False
+            await pilot.pause(0.15)
+            await pilot.click("#dump-ok")
+            for _ in range(40):
+                if app.result is not None:
+                    break
+                await pilot.pause(0.05)
+            assert app.result == str(out_file)
+            assert "after error" in out_file.read_text()
+
+    asyncio.run(_run())
+
+
+def test_dump_modal_buttons_submit_and_cancel(tmp_path, monkeypatch):
+    import asyncio
+
+    out_file = tmp_path / "button-dump.log"
+    target = FakeLogTarget(lines=[LogLine(host="h1", container="c1", text="button line")])
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+    summary = ScopeSummary(node_containers=1, cluster_containers=1, cluster_hosts=1)
+
+    async def _run():
+        screen = DumpLogScreen(host="h1", cluster_id="cid1", container="c1", summary=summary)
+        app = _DumpModalTestApp(screen)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            assert str(screen.query_one("#dump-cancel", Button).label) == "Cancel"
+            assert str(screen.query_one("#dump-ok", Button).label) == "OK"
+            screen.query_one("#dump-path-input", Input).value = str(out_file)
+            await pilot.click("#dump-ok")
+            for _ in range(40):
+                if app.result is not None:
+                    break
+                await pilot.pause(0.05)
+            assert app.result == str(out_file)
+            assert "button line" in out_file.read_text()
+
+    asyncio.run(_run())
+
+    async def _run_cancel():
+        screen = DumpLogScreen(host="h1", cluster_id="cid1", container="c1", summary=summary)
+        app = _DumpModalTestApp(screen)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            await pilot.click("#dump-cancel")
+            await pilot.pause(0.05)
+            assert app.result is None
+            assert not isinstance(app.screen, DumpLogScreen)
+
+    asyncio.run(_run_cancel())
 
 
 def test_dump_modal_escape_during_dump_cancels_immediately(tmp_path, monkeypatch):
@@ -3589,6 +3957,12 @@ def test_log_pane_scroll_up_decouples_from_live_stream(monkeypatch):
                 await asyncio.sleep(0.002)
             assert resumed
             assert pane.view_state.pending_lines == 0
+            # The stream is still appending: follow re-anchors on its next paint,
+            # so give it one instead of sampling at an arbitrary instant.
+            for _ in range(50):
+                if pane.log_view.is_at_bottom:
+                    break
+                await asyncio.sleep(0.002)
             assert pane.log_view.is_at_bottom
 
     asyncio.run(_run())
@@ -3847,6 +4221,9 @@ def test_log_pane_stream_paint_gate(monkeypatch):
             pane.buffer._entries.clear()
             gen = pane._generation
             view = pane.log_view
+            # The wrap map tracks entries; a raw clear() on the buffer (test shortcut)
+            # leaves it stale, and heights below are compared against len(buffer).
+            view.refresh_buffer()
 
             # 1) Arrival after an idle gap paints immediately (gate clock backdated).
             view._stream_paint_at = time.monotonic() - 1.0
@@ -4271,5 +4648,263 @@ def test_log_view_compensation_after_immediate_user_scroll_keeps_target(monkeypa
             await pilot.wait_for_scheduled_animations()
             assert lv.scroll_y == 0
             assert pane.view_state.state == FollowState.SCROLLED
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Log pane metrics footer
+# ---------------------------------------------------------------------------
+
+# One vLLM v1 engine stat line as the container emits it (vllm/v1/metrics/loggers.py).
+_VLLM_STAT_LINE = (
+    "INFO 10-17 08:12:34 [loggers.py:331] Engine 000: Avg prompt throughput: 123.4 tokens/s, "
+    "Avg generation throughput: 45.6 tokens/s, Running: 3 reqs, Waiting: 1 reqs, "
+    "GPU KV cache usage: 12.3%, Prefix cache hit rate: 45.6%"
+)
+
+
+def test_log_pane_metrics_footer_renders_tracker_sample_once_target_ready(monkeypatch):
+    """The footer shows what the background tracker already collected, as soon as the target resolves."""
+    import asyncio
+
+    from sparkrun.cli._monitor_metrics import _SPARK_GLYPHS
+
+    target = FakeLogTarget(lines=[])
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+
+    async def _run():
+        pane = LogPane(host="h1", cluster_id="cid1", container="c1", scope=LogScope.CONTAINER)
+        app = _LogPaneTestApp(pane)
+        app.metrics_scraper.observe(("h1", "c1"), _VLLM_STAT_LINE)
+        app.metrics_scraper.commit()
+
+        async with app.run_test(size=(100, 20)):
+            await asyncio.sleep(0.05)
+            footer = pane.query_one("#log-metrics", Static)
+
+            # No stream line was delivered: the row comes from the tracker alone.
+            assert footer.display is True
+            content = str(footer.content)
+            assert "tg" in content  # 5-column label field
+            assert any(glyph in content for glyph in _SPARK_GLYPHS)
+            assert "45.6" in content
+
+            # ... and it sits above the status/settings bar, which stays the
+            # pane's bottom row whether or not the metrics row is showing.
+            status = pane.query_one("#log-status", Static)
+            assert footer.region.y < status.region.y
+            assert status.region.bottom == pane.region.bottom
+
+    asyncio.run(_run())
+
+
+def test_log_pane_footer_shows_the_window_average(monkeypatch):
+    """The number is the newest window's mean: several prints in one poll collapse to one point."""
+    import asyncio
+
+    target = FakeLogTarget(lines=[])
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+
+    async def _run():
+        pane = LogPane(host="h1", cluster_id="cid1", container="c1", scope=LogScope.CONTAINER)
+        app = _LogPaneTestApp(pane)
+        # Both prints belong to one tracker window, so its single ring point is their mean.
+        app.metrics_scraper.observe(("h1", "c1"), "Avg generation throughput: 40.0 tokens/s")
+        app.metrics_scraper.observe(("h1", "c1"), "Avg generation throughput: 50.0 tokens/s")
+        app.metrics_scraper.commit()
+
+        async with app.run_test(size=(100, 20)):
+            await asyncio.sleep(0.05)
+            content = str(pane.query_one("#log-metrics", Static).content)
+
+            assert "45.0" in content
+            assert "40.0" not in content
+            assert "50.0" not in content
+
+    asyncio.run(_run())
+
+
+def test_log_pane_blank_rows_frame_the_log_view(monkeypatch):
+    """A blank row under the title and one above the sparklines, with no orphan row when they hide."""
+    import asyncio
+
+    target = FakeLogTarget(lines=[])
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+
+    async def _run():
+        pane = LogPane(host="h1", cluster_id="cid1", container="c1", scope=LogScope.CONTAINER)
+        app = _LogPaneTestApp(pane)
+        app.metrics_scraper.observe(("h1", "c1"), _VLLM_STAT_LINE)
+        app.metrics_scraper.commit()
+
+        async with app.run_test(size=(100, 20)):
+            await asyncio.sleep(0.25)
+            title = pane.query_one("#log-title", Static)
+            view = pane.log_view
+            footer = pane.query_one("#log-metrics", Static)
+            status = pane.query_one("#log-status", Static)
+
+            # Wrapping on: no horizontal scrollbar, so both blank rows are spent.
+            assert view.show_horizontal_scrollbar is False
+            assert view.region.y == title.region.bottom + 1
+            assert footer.region.y == view.region.bottom + 1
+            assert status.region.y == footer.region.bottom
+
+            # A hidden metrics row takes its own spacer with it; the title's stays.
+            footer.display = False
+            await asyncio.sleep(0.05)
+            assert view.region.y == title.region.bottom + 1
+            assert status.region.y == view.region.bottom
+
+    asyncio.run(_run())
+
+
+def test_log_pane_blank_rows_yield_to_the_horizontal_scrollbar(monkeypatch):
+    """Unwrapped wide content trades the spacers for the bar, and a follower keeps the tail."""
+    import asyncio
+
+    lines = [LogLine(host="h1", container="c1", text=f"line {i} " + "x" * 180) for i in range(60)]
+    target = FakeLogTarget(lines=lines)
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+
+    async def _run():
+        pane = LogPane(host="h1", cluster_id="cid1", container="c1", scope=LogScope.CONTAINER)
+        pane.log_view.wrap = False
+        app = _LogPaneTestApp(pane)
+        app.metrics_scraper.observe(("h1", "c1"), _VLLM_STAT_LINE)
+        app.metrics_scraper.commit()
+
+        async with app.run_test(size=(60, 20)):
+            # The pane acts on the settled verdict, one settle window after mount.
+            await asyncio.sleep(0.3)
+            title = pane.query_one("#log-title", Static)
+            view = pane.log_view
+            footer = pane.query_one("#log-metrics", Static)
+
+            # Unwrapped content wider than the view: the bar is up and takes the
+            # sparkline spacer, but the row below the title stays.
+            assert view.show_horizontal_scrollbar is True
+            assert "spark-gap" not in pane.classes
+            assert view.region.y == title.region.bottom + 1
+            assert footer.region.y == view.region.bottom
+
+            # Wrapping back on retires the bar, and the viewport shrinking under a
+            # following view must not leave it short of the tail: the stream is
+            # idle here, so nothing else re-anchors it.
+            pane.log_view.wrap = True
+            await asyncio.sleep(0.3)
+            assert view.show_horizontal_scrollbar is False
+            assert "spark-gap" in pane.classes
+            assert view.region.y == title.region.bottom + 1
+            assert footer.region.y == view.region.bottom + 1
+            assert pane.view_state.is_following is True
+            assert view.is_at_bottom is True
+
+    asyncio.run(_run())
+
+
+def test_log_pane_metrics_footer_stream_lines_do_not_feed_metrics(monkeypatch):
+    """The pane's own stream never feeds metrics: the app tracker owns them."""
+    import asyncio
+
+    target = FakeLogTarget(lines=[])
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+
+    async def _run():
+        pane = LogPane(host="h1", cluster_id="cid1", container="c1", scope=LogScope.CONTAINER)
+        app = _LogPaneTestApp(pane)
+        async with app.run_test(size=(100, 20)):
+            await asyncio.sleep(0.05)
+            footer = pane.query_one("#log-metrics", Static)
+            line = LogLine(host="h1", container="c1", text=_VLLM_STAT_LINE)
+
+            # Neither prepended history nor follow traffic warms the strip.
+            pane.buffer.prepend_page([line])
+            assert footer.display is False
+
+            pane._on_lines([line], gen=pane._generation, from_follow=False)
+            pane._on_lines([line], gen=pane._generation, from_follow=True)
+            await asyncio.sleep(0.05)
+            assert footer.display is False
+            assert app.metrics_scraper.latest("gen") is None
+
+    asyncio.run(_run())
+
+
+def test_log_pane_metrics_footer_scope_switch_hides_footer_and_keeps_tracker_data(monkeypatch):
+    """A scope switch hides the row until the new target resolves; the tracker's data survives."""
+    import asyncio
+
+    from sparkrun.core.log_source import LogSource
+
+    target = FakeLogTarget(lines=[])
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+
+    async def _run():
+        pane = LogPane(host="h1", cluster_id="cid1", container="c1", scope=LogScope.CONTAINER)
+        app = _LogPaneTestApp(pane)
+        app.metrics_scraper.observe(("h1", "c1"), _VLLM_STAT_LINE)
+        app.metrics_scraper.commit()
+
+        async with app.run_test(size=(100, 20)):
+            await asyncio.sleep(0.05)
+            footer = pane.query_one("#log-metrics", Static)
+            assert footer.display is True
+
+            pane._start_follow_worker(LogScope.CLUSTER)
+            assert footer.display is False
+            # Scope is a pane view concern: the tracked history is not discarded.
+            assert app.metrics_scraper.latest("gen") == 45.6
+            assert app.metrics_scraper.history("gen") == [45.6]
+
+            cluster_target = FakeLogTarget(
+                lines=[],
+                sources=[
+                    LogSource(host="h1", container="c1", role="head", rank=0),
+                    LogSource(host="h2", container="c2", role="worker", rank=1),
+                ],
+            )
+            pane._on_target_ready(cluster_target, pane._generation)
+            assert footer.display is True
+
+    asyncio.run(_run())
+
+
+def test_log_pane_metrics_footer_filters_to_target_sources(monkeypatch):
+    """The row aggregates only the sources in the pane's current scope."""
+    import asyncio
+
+    from sparkrun.core.log_source import LogSource
+
+    target = FakeLogTarget(lines=[])
+    monkeypatch.setattr("sparkrun.cli._monitor_logs.open_log_target", lambda *a, **kw: target)
+
+    async def _run():
+        pane = LogPane(host="h1", cluster_id="cid1", container="c1", scope=LogScope.CONTAINER)
+        app = _LogPaneTestApp(pane)
+        app.metrics_scraper.observe(("h1", "c1"), "Avg generation throughput: 100.0 tokens/s")
+        app.metrics_scraper.observe(("h2", "c2"), "Avg generation throughput: 50.0 tokens/s")
+        app.metrics_scraper.commit()
+
+        async with app.run_test(size=(100, 20)):
+            await asyncio.sleep(0.05)
+            footer = pane.query_one("#log-metrics", Static)
+
+            # Container scope: one source, so one rank's value — not the cluster sum.
+            assert "100.0" in str(footer.content)
+            assert "150.0" not in str(footer.content)
+
+            pane._on_target_ready(
+                FakeLogTarget(
+                    lines=[],
+                    sources=[
+                        LogSource(host="h1", container="c1", role="head", rank=0),
+                        LogSource(host="h2", container="c2", role="worker", rank=1),
+                    ],
+                ),
+                pane._generation,
+            )
+            assert "150.0" in str(footer.content)
 
     asyncio.run(_run())

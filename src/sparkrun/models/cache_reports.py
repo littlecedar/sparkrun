@@ -81,3 +81,28 @@ class CacheReport(ReportMapping):
         if isinstance(location, dict):
             location = CacheLocation(**{**location, "hosts": tuple(location["hosts"])})
         return cls(**{**value, "entries": tuple(CacheEntry(**entry) for entry in value["entries"]), "location": location})
+
+
+@dataclass(frozen=True)
+class ClaimReconciliation(ReportMapping):
+    """One outstanding workload claim and what ``reconcile_claims`` decided.
+
+    *status* is ``orphaned`` (the workload was confirmed absent from every
+    host in the claim), ``running``, ``foreign`` (another distribution's
+    workload, which status cannot see), ``unverified`` (a claim host or the
+    workload's executor was not observed, or the record is malformed), ``preparing`` (a pending operation on this control machine
+    names the workload) or ``recent`` (younger than the minimum age, so it may
+    belong to a launch still preparing elsewhere). Only an orphaned claim gets
+    an *action*: ``would_release``, ``released``, or ``failed`` with *reason*.
+    """
+
+    repo: str
+    revision: str
+    claim: str
+    workload: str | None
+    hosts: tuple[str, ...]
+    created: float | None
+    status: str
+    reason: str
+    action: str | None = None
+    location: CacheLocation | None = None

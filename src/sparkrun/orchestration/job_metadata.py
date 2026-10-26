@@ -92,6 +92,7 @@ def check_job_running(
     cache_dir: str | None = None,
     check_http_models: bool = False,
     port: int | None = None,
+    host_hardware: dict | None = None,
 ) -> JobStatus:
     """Check whether a sparkrun job is currently running.
 
@@ -112,6 +113,11 @@ def check_job_running(
             ``/v1/models`` endpoint.
         port: Explicit port for health checks.  Falls back to metadata
             then default 8000.
+        host_hardware: The cluster's saved per-host inventory
+            (``ClusterDefinition.hosts_hardware``), as ``api.status`` passes
+            it.  Without it the executor falls back to
+            ``resolve_hardware()``, which raises under a
+            ``require-metadata`` application profile.
 
     Returns:
         :class:`JobStatus` with liveness and optional health info.
@@ -165,7 +171,7 @@ def check_job_running(
         auto_user=False,
     )
     ssh_kwargs = job_ssh_kwargs(executor.resolve_target(dry_run=True), meta, ssh_kwargs, explicit_user="ssh_user" in (ssh_kwargs or {}))
-    status_snapshot = executor.query_status(hosts, ssh_kwargs=ssh_kwargs)
+    status_snapshot = executor.query_status(hosts, ssh_kwargs=ssh_kwargs, host_hardware=host_hardware)
 
     running = cluster_id in status_snapshot.running_cluster_ids()
 
@@ -613,8 +619,14 @@ def save_job_metadata(
     digest = _filename_digest(cluster_id)
     jobs_dir = Path(cache_dir) / "jobs"
     existing = jobs_dir / f"{digest}.yaml"
-    if existing.exists() and load_job_metadata(cluster_id, cache_dir=cache_dir) is None:
+    previous = load_job_metadata(cluster_id, cache_dir=cache_dir) if existing.exists() else None
+    if existing.exists() and previous is None:
         raise ValueError("Refusing to replace metadata owned by another distribution: %s" % existing)
+    # A relaunch under the same cluster_id replaces the earlier containers by
+    # name without stopping them, so the earlier launch's cache claims are
+    # never released by anything but this record's eventual ``stop``. Dropping
+    # them here orphans them on the hosts for good.
+    model_cache_claims = _merge_claims((previous or {}).get("model_cache_claims"), model_cache_claims)
     jobs_dir.mkdir(parents=True, exist_ok=True)
     # Metadata can carry the resolved upstream API key (see below), so keep the
     # directory owner-only.  Best-effort: a pre-existing dir from an older
@@ -799,6 +811,36 @@ def save_job_metadata(
 
     atomic_private_write(meta_path, yaml.safe_dump(meta, default_flow_style=False))
     logger.debug("Saved job metadata to %s", meta_path)
+
+
+def _merge_claims(previous, current):
+    merged = []
+    for ref in [*(previous or ()), *(current or ())]:
+        if ref not in merged:
+            merged.append(ref)
+    return merged
+
+
+def forget_model_cache_claims(cluster_id: str, refs, cache_dir: str | None = None, *, sctx: "SparkrunContext | None" = None) -> None:
+    """Drop already-released claim *refs* from a job record, keeping everything else.
+
+    ``save_job_metadata`` carries earlier claims forward, so a released ref left
+    in the record would make every later stop target its host again.
+    """
+    cache_dir = _resolve_cache_dir(cache_dir, sctx)
+    meta = load_job_metadata(cluster_id, cache_dir=cache_dir)
+    if not meta or not meta.get("model_cache_claims"):
+        return
+    kept = [ref for ref in meta["model_cache_claims"] if ref not in refs]
+    if len(kept) == len(meta["model_cache_claims"]):
+        return
+    if kept:
+        meta["model_cache_claims"] = kept
+    else:
+        del meta["model_cache_claims"]
+    from sparkrun.utils.fs import atomic_private_write
+
+    atomic_private_write(Path(cache_dir) / "jobs" / f"{_filename_digest(cluster_id)}.yaml", yaml.safe_dump(meta, default_flow_style=False))
 
 
 def remove_job_metadata(

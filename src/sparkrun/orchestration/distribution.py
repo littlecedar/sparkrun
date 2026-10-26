@@ -6,6 +6,7 @@ from sparkrun.core.operation import submit as _operation_submit
 
 import hashlib
 import logging
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from dataclasses import dataclass
@@ -215,7 +216,10 @@ def _distribute_from_head(
 
     # Default verbosity captures silently; INFO+ streams to terminal so long-running
     # operations (model downloads, image pulls) show progress instead of hanging mute.
-    _quiet = not logging.getLogger().isEnabledFor(logging.INFO)
+    # A process that does not own stdout (a Textual app swaps sys.stdout for its
+    # capture; the OS fd is never redirected) must capture instead: the streaming
+    # branch runs an inherited-stdio subprocess that paints straight over the screen.
+    _quiet = not logging.getLogger().isEnabledFor(logging.INFO) or sys.stdout is not sys.__stdout__
 
     # Step 1: ensure resource on head
     ensure_result = run_remote_script_streaming(

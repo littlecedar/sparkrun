@@ -29,6 +29,12 @@ def owns_metadata(data: dict) -> bool:
     )
 
 
+def resource_namespace_of(name: str) -> str | None:
+    """The distribution namespace a workload id carries, or ``None`` if it is not one."""
+    match = _JOB_NAME.fullmatch(name)
+    return match["namespace"] if match else None
+
+
 def assert_resource_namespace(name: str) -> None:
     match = _JOB_NAME.fullmatch(name)
     if match and match["namespace"] != get_application_profile().resource_namespace:

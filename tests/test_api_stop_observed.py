@@ -161,6 +161,92 @@ def test_stop_releases_cache_claims_only_after_confirmed_teardown(observed_job, 
         assert job.forgotten == []  # Recovery metadata still covers h0, h2 and h3.
 
 
+@pytest.mark.parametrize("unreachable", [False, True])
+def test_stop_tears_down_and_releases_claims_an_earlier_launch_left_elsewhere(observed_job, monkeypatch, unreachable):
+    """A same-id relaunch placed on other hosts keeps the earlier launch's claim (h9)."""
+    from unittest.mock import Mock
+
+    job = observed_job()
+    from sparkrun.orchestration.job_metadata import load_job_metadata
+
+    meta = load_job_metadata(PRIOR)
+    meta["hosts"] = ["h1"]
+    meta["model_cache_claims"] = [{"claim": "latest", "host": "h1"}, {"claim": "earlier", "host": "h9"}]
+    if unreachable:
+
+        def cleanup(mapping, *, executor, ssh_kwargs):
+            job.calls.append((mapping, executor, ssh_kwargs))
+            return {
+                host: RemoteResult(host, returncode=255 if host == "h9" else 0, stdout="sparkrun_removed=0\n", stderr="unreachable")
+                for host in mapping
+            }
+
+        monkeypatch.setattr("sparkrun.orchestration.primitives.cleanup_containers_by_host", cleanup)
+    release = Mock()
+    monkeypatch.setattr("sparkrun.models.usage.release_claims", release)
+
+    result = api.stop(workload_id=PRIOR, hosts=["h1"], cluster=job.cluster, sctx=job.sctx, discovered=job.snapshot)
+
+    # The earlier host is torn down by candidate names, which discovery need not cover.
+    assert "h9" in job.calls[-1][0] and PRIOR + "_solo" in job.calls[-1][0]["h9"]
+    assert result.hosts_targeted == ("h1", "h9")
+    assert result.success  # the workload's own hosts confirmed
+    if unreachable:
+        assert set(release.call_args.kwargs["hosts"]) == {"h1"}
+        assert job.forgotten == []
+        assert any("model-cache reconcile --all" in w and "h9" in w for w in result.warnings)
+    else:
+        assert set(release.call_args.kwargs["hosts"]) == {"h1", "h9"}
+        assert job.forgotten == [PRIOR]
+        assert result.warnings == ()
+
+
+def test_scoped_stop_does_not_widen_to_the_latest_launchs_other_hosts(observed_job, monkeypatch):
+    monkeypatch.setattr("sparkrun.models.usage.release_claims", lambda claims, **kw: None)
+    job = observed_job()
+    from sparkrun.orchestration.job_metadata import load_job_metadata
+
+    load_job_metadata(PRIOR)["model_cache_claims"] = [{"claim": "c", "host": host} for host in job.cluster.hosts]
+    result = api.stop(workload_id=PRIOR, hosts=["h1"], cluster=job.cluster, sctx=job.sctx, discovered=job.snapshot)
+    assert [list(call[0]) for call in job.calls] == [["h1"]]
+    assert result.hosts_targeted == ("h1",) and result.warnings == ()
+
+
+@pytest.mark.parametrize("recorded_executor", ["docker", "local", None])
+def test_same_id_relaunch_releases_earlier_claims_only_where_the_sweep_saw_it_gone(observed_job, monkeypatch, recorded_executor):
+    """h0 was observed without the workload; it still runs on h1; h7 was never swept."""
+    job = observed_job()
+    from sparkrun.orchestration.job_metadata import load_job_metadata
+
+    meta = load_job_metadata(PRIOR)
+    meta["executor"] = recorded_executor
+    claims = [{"claim": "earlier", "host": host} for host in ("h0", "h1", "h7")]
+    meta["model_cache_claims"] = claims
+    released, forgotten = [], []
+    monkeypatch.setattr("sparkrun.models.usage.release_claims", lambda refs, **kw: released.append((refs, set(kw["hosts"]))))
+    monkeypatch.setattr(
+        "sparkrun.orchestration.job_metadata.forget_model_cache_claims", lambda cid, refs, **kw: forgotten.append((cid, refs))
+    )
+
+    evicted, _ = _evict_superseded_deployments(
+        intent_id=INTENT,
+        cluster_id_for_launch=PRIOR,
+        candidate_hosts=job.cluster.hosts,
+        target_hosts=["h1"],
+        cluster_def=job.cluster,
+        config=job.sctx.config,
+        sctx=job.sctx,
+    )
+
+    assert evicted == [] and job.calls == []  # the runtime replaces its own containers by name
+    if recorded_executor == "docker":
+        assert released == [([claims[0]], {"h0"})]
+        assert forgotten == [(PRIOR, [claims[0]])]
+    else:
+        # An executor the sweep did not query (or none recorded) proves nothing.
+        assert released == [] and forgotten == []
+
+
 @pytest.mark.parametrize("mismatch", ["executor", "destination", "user", "missing_names"])
 def test_unusable_observation_never_forgets_job(observed_job, mismatch):
     job = observed_job("local")

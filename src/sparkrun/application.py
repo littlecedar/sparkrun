@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 from sparkrun.core.application_profile import (
     ApplicationProfile,
+    DefaultPlugin,
     UpdateSource,
     APPLICATION_PROFILE_API_VERSION,
     child_environment,
@@ -22,6 +23,7 @@ from sparkrun.core.application_identity import ApplicationIdentity, ControllerId
 
 __all__ = (
     "ApplicationProfile",
+    "DefaultPlugin",
     "UpdateSource",
     "APPLICATION_PROFILE_API_VERSION",
     "ApplicationIdentity",

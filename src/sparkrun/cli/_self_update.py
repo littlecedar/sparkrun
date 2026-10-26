@@ -256,6 +256,9 @@ def reconcile_plugin_updates(config_path, *, update: bool = True) -> bool:
     changed = False
     if report.get("warning"):
         click.echo("Warning: " + report["warning"], err=True)
+    for default in report.get("defaults", []):
+        if default["status"] == "failed":
+            click.echo("Warning: default plugin %s installation failed: %s" % (default["name"], default["error"]), err=True)
     click.echo("Checking plugin compatibility against Sparkrun %s..." % report["host"].get("core_version", "unknown"))
     for row in report["plugins"]:
         outcome = row["outcome"]

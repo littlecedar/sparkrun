@@ -274,6 +274,7 @@ def retention(
     if action == "inventory":
         return result
     if action in {"pin", "reconcile"}:
+        revision = resolve_named_revision(root, repo, revision)
         rows = [r for r in rows if r["repo"] == repo and r["revision"] == revision and r["tracked"]]
         if len(rows) != 1:
             raise ValueError("tracked model revision not found")
@@ -386,6 +387,20 @@ def read_ref(path):
         return None
     value = path.read_text().strip()
     return value if re.fullmatch(NAME_PATTERN, value) else None
+
+
+def resolve_named_revision(root, repo, revision):
+    """A full commit as given, or the commit this cache's ``refs/<revision>`` names (e.g. ``main``)."""
+    if not isinstance(repo, str) or not re.fullmatch(REPO_PATTERN, repo):
+        raise ValueError("invalid repository")
+    if not isinstance(revision, str) or not re.fullmatch(NAME_PATTERN, revision):
+        raise ValueError("invalid revision")
+    if re.fullmatch(r"[0-9a-f]{40}", revision):
+        return revision
+    resolved = read_ref(root / "hub" / ("models--" + repo.replace("/", "--")) / "refs" / revision)
+    if resolved is None or not re.fullmatch(r"[0-9a-f]{40}", resolved):
+        raise ValueError("%s has no cached ref %r here; name a full commit" % (repo, revision))
+    return resolved
 
 
 def blob_link(path, repo_blobs):

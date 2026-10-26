@@ -49,7 +49,7 @@ packages maintained outside the core repository.
 For console-free use, call `sparkrun.application.initialize(profile=PROFILE,
 config_path=...)`. It returns a `SparkrunContext` exposing `config`, `variables`
 and `application_profile`; importing the API does not import the CLI.
-`api.default_sctx()` delegates to this initializer. `UpdateSource` and
+`api.default_sctx()` delegates to this initializer. `DefaultPlugin`, `UpdateSource`, and
 `APPLICATION_PROFILE_API_VERSION` are also exported by `sparkrun.application`;
 see the [supported import map](DISTRIBUTION_API_MIGRATION.md#supported-imports). Ordinary console,
 `python -m sparkrun`, and implicit API initialization select built-in Sparkrun.
@@ -58,6 +58,58 @@ One profile is active per process. Repeating that selection is idempotent;
 changing it raises an error. Select before reading config, paths, feature flags,
 plugins or SAF. The profile recursively copies/freezes nested defaults. The test
 reset is not a production profile-switch API.
+
+## Default plugins
+
+Profiles can provide optional managed Git plugins independently of the
+application's Python dependencies and release cadence:
+
+```python
+from sparkrun.application import ApplicationProfile, DefaultPlugin
+
+PROFILE = ApplicationProfile(
+    id="example-product",
+    display_name="Example Product",
+    command="example-product",
+    package="example-product",
+    profile_ref="example_product.profile:PROFILE",
+    default_plugins=(
+        DefaultPlugin(
+            name="example-integration",
+            module="example_integration",
+            source="https://github.com/example/example-integration",
+            ref="main",
+            trusted=True,
+        ),
+    ),
+)
+```
+
+The catalog is copied into an immutable tuple and rejects duplicate IDs or
+modules. IDs must use their canonical lowercase, hyphen-separated spelling.
+Sources use the managed plugin Git formats (HTTPS, SSH, or an absolute local
+`file:///` URL). Branches track updates; tags and full commits stay pinned.
+The acquired manifest must match the declared ID, module, and repository.
+
+`trusted=True` is the application's explicit authorization to execute that
+source and future compatible updates. It defaults to false. This trust is
+scoped to the managed payload and does not activate arbitrary plugin
+directories or trust the plugin's recipe registries. Application profiles must
+be installed, trusted application code; plugin registration cannot contribute
+catalog entries. Provide an importable `profile_ref` so candidate validation
+and lifecycle subprocesses use the same profile.
+
+Alternate profiles default to `default_plugins=()` and never inherit Sparkrun's
+catalog. `None` is reserved for the built-in Sparkrun profile, whose catalog in
+`core/plugin_defaults.py` is currently empty. This is separate from
+`integrations`/`required_integrations`, which select already available providers.
+
+Initialization, core updates, and `plugins update --all` install missing trusted
+defaults. Existing providers and user source/ref selections win. Failures are
+nonfatal during initialization and core updates; explicit `plugins sync` and
+`plugins update --all` return a nonzero status for installation failures.
+Use `plugins sync --dry-run --json` to inspect the catalog without fetching or
+executing code. See [plugin controls and opt-outs](PLUGINS.md#default-plugins).
 
 ## Plugin identity and shared services
 
@@ -284,7 +336,8 @@ a remote path. HuggingFace caches continue using HuggingFace's own shared policy
 
 Alternate products do not automatically inherit `SPARKRUN_*` overrides. The
 intentional shared controls are test containment (`SPARKRUN_NO_TELEMETRY`,
-`SPARKRUN_NO_EXTERNAL_PLUGINS`, `SPARKRUN_NO_INSTALLED_PLUGINS`) and the internal
+`SPARKRUN_NO_EXTERNAL_PLUGINS`, `SPARKRUN_NO_INSTALLED_PLUGINS`,
+`SPARKRUN_NO_DEFAULT_PLUGINS`) and the internal
 child identity variables `SPARKRUN_APPLICATION_PROFILE` and
 `SPARKRUN_APPLICATION_CONFIG` (the latter only for an explicitly supplied
 same-controller config path). Product feature overrides

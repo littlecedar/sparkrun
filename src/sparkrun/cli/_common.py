@@ -909,8 +909,8 @@ def _registry_recipe_summaries(registry_mgr, entry) -> list[dict]:
     seen: set[str] = set()
     unique = []
     for summary in registry_mgr._list_dir_recipes(recipe_dir, entry.name, entry):
-        if summary["file"] not in seen:  # one completion per typeable name
-            seen.add(summary["file"])
+        if summary["name"] not in seen:  # one completion per typeable name
+            seen.add(summary["name"])
             unique.append(summary)
     return unique
 
@@ -937,7 +937,7 @@ class RecipeNameType(click.ParamType):
             # since @registry/name contains '/' but is not a filesystem path)
             if incomplete.startswith("@"):
                 config, registry_mgr = _get_config_and_registry()
-                from sparkrun.core.recipe import list_recipes
+                from sparkrun.core.recipe import recipe_listing_key
 
                 if "/" not in incomplete:
                     # No slash yet — try to expand directly to @registry/recipe
@@ -954,7 +954,7 @@ class RecipeNameType(click.ParamType):
                         matching_registries.append(reg)
                         recipes = _registry_recipe_summaries(registry_mgr, reg)
                         for r in recipes:
-                            items.append(click.shell_completion.CompletionItem("@%s/%s" % (reg.name, r["file"])))
+                            items.append(click.shell_completion.CompletionItem(r["name"]))
                     if not items and matching_registries:
                         # No recipes found — show registry names so the user
                         # can still discover and select the registry.
@@ -977,9 +977,9 @@ class RecipeNameType(click.ParamType):
                         return []
                     recipes = _registry_recipe_summaries(registry_mgr, entry)
                     return [
-                        click.shell_completion.CompletionItem("@%s/%s" % (registry_name, r["file"]))
+                        click.shell_completion.CompletionItem(r["name"])
                         for r in recipes
-                        if r["file"].startswith(recipe_prefix)
+                        if recipe_listing_key(r).startswith(recipe_prefix) or r["file"].startswith(recipe_prefix)
                     ]
 
             # File-path completion when input looks like a path
@@ -987,11 +987,15 @@ class RecipeNameType(click.ParamType):
                 return _complete_yaml_files(incomplete)
 
             # Default: list recipe names from visible registries only
-            from sparkrun.core.recipe import list_recipes, discover_cwd_recipes
+            from sparkrun.core.recipe import list_recipes, discover_cwd_recipes, recipe_listing_key
 
             config, registry_mgr = _get_config_and_registry()
             recipes = list_recipes(registry_manager=registry_mgr, include_hidden=False, local_files=discover_cwd_recipes())
-            return [click.shell_completion.CompletionItem(r["file"]) for r in recipes if r["file"].startswith(incomplete)]
+            return [
+                click.shell_completion.CompletionItem(r["name"] if recipe_listing_key(r) != r["file"] else r["file"])
+                for r in recipes
+                if r["file"].startswith(incomplete) or recipe_listing_key(r).startswith(incomplete)
+            ]
         except Exception:
             return []
 

@@ -63,6 +63,40 @@ def test_invalid_config_values_rejected(value):
         et.render_env_template("{config.x}", {"x": value}, {})
 
 
+@pytest.mark.parametrize("launch", [{}, {"model_revision": None}])
+def test_absent_revision_is_not_a_resolved_empty_revision(launch):
+    with pytest.raises(ValueError, match="unavailable.*model_revision"):
+        et.render_env_template("{launch.model_revision}", {}, launch)
+
+
+@pytest.mark.parametrize("field", sorted(et.LAUNCH_FIELDS - {"model_revision"}))
+def test_other_empty_launch_fields_remain_unavailable(field):
+    with pytest.raises(ValueError, match="unavailable"):
+        et.render_env_template("{launch." + field + "}", {}, {field: ""})
+
+
+@pytest.mark.parametrize("pin", [None, SHA])
+def test_resolved_local_model_renders_empty_revision(tmp_path, monkeypatch, pin):
+    path = tmp_path / "local model 'quoted'"
+    path.mkdir()
+    (path / "config.json").write_text("{}")
+    (path / "weights.safetensors").write_bytes(b"weights")
+
+    def probe(host, script, **kwargs):
+        result = subprocess.run(["bash"], input=script, capture_output=True, text=True, timeout=5)
+        return RemoteResult(host, result.returncode, result.stdout, result.stderr)
+
+    monkeypatch.setattr("sparkrun.orchestration.primitives.run_script_on_host", probe)
+    r = recipe(
+        model=str(path),
+        model_revision=pin,
+        env={"M": "{launch.model_path}", "R": "{launch.model_revision}", "C": "pack/{launch.model_revision}"},
+    )
+    plan = et.prepare_env_templates(r, {}, ["head", "worker"], "id", str(tmp_path / "hf"), {})
+    for host in plan.hosts:
+        assert plan.render(host, {str(path): "/model"}, None, DockerExecutor()) == {"M": "/model", "R": "", "C": "pack/"}
+
+
 def test_probe_exact_ref_and_pinned_commit_without_ref(tmp_path):
     path = snapshot(tmp_path, ref="releases/stable")
     assert resolve_model_path("org/model", "releases/stable", str(tmp_path)) == {"path": str(path), "revision": SHA}

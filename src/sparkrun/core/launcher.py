@@ -1515,6 +1515,13 @@ def launch_inference(
     executor = host_executors[host_list[0]]
     executor.bind_host_executors(host_executors)
     runtime.executor = executor
+    if not dry_run:
+        from sparkrun.models.usage import set_workload_executor
+
+        # One name for every host, or none: a mixed launch keeps the
+        # conservative unrecorded-executor treatment in reconcile.
+        names = {getattr(ex, "executor_name", None) for ex in host_executors.values()}
+        set_workload_executor(names.pop() if len(names) == 1 else None)
 
     # Preflight: verify the host paths this launch will bind actually exist on
     # the substrate where the workload runs — pre-placed weights (whose
@@ -1852,12 +1859,22 @@ def launch_inference(
     from sparkrun.models.runtime import bind_runtime_models, validate_runtime_command
     from sparkrun.orchestration.primitives import build_volumes, resolved_model_volume
 
-    if _resolved_model_path and not dry_run and (asset_policy is None or asset_policy.prepare_model):
+    _preflight_local_model = _resolved_model_path if asset_policy is None or asset_policy.prepare_model else None
+    _local_model_format = "opaque"
+    if _preflight_local_model and not dry_run:
+        _local_model_format = "hf" if runtime.get_family() in {"vllm", "sglang", "atlas", "modular-max"} else "opaque"
         from sparkrun.core.model_distribution import validation_policy
         from sparkrun.models.preparation import validate_preplaced
 
         policy = validation_policy(config)
-        validate_preplaced(recipe.model, host_list, model_path=_resolved_model_path, ssh_kwargs=ssh_kwargs, checksums=policy == "checksum")
+        validate_preplaced(
+            recipe.model,
+            host_list,
+            model_path=_preflight_local_model,
+            ssh_kwargs=ssh_kwargs,
+            checksums=policy == "checksum",
+            model_format=_local_model_format,
+        )
 
     if prepared_model(recipe.model, host_list[0]) is not None:
         bind_runtime_models(
@@ -1986,7 +2003,7 @@ def launch_inference(
             hook_timeout_scope(getattr(config, "hook_timeout_s", None)),
         ):
             activation_receipt = execution_strategy.prepare_activation(activation_context)
-        if not dry_run and prepared_model(recipe.model, host_list[0]) is not None:
+        if not dry_run and (prepared_model(recipe.model, host_list[0]) is not None or _preflight_local_model):
             from sparkrun.models.runtime import verify_workload_access
 
             verify_workload_access(
@@ -1996,6 +2013,8 @@ def launch_inference(
                 build_volumes(effective_cache_dir, extra={**runtime.get_extra_volumes(), **resolved_model_volume(recipe)}),
                 ssh_kwargs,
                 extra_opts=(runtime.get_extra_docker_opts() or []) + (extra_docker_opts or []),
+                local_model_path=_preflight_local_model,
+                local_model_format=_local_model_format,
             )
         # The barrier stays core-owned. A strategy never decides when the
         # deployment it replaces is torn down.
@@ -2121,7 +2140,7 @@ def launch_inference(
         dry_run=dry_run,
         extra_docker_opts=(runtime.get_extra_docker_opts() or []) + (extra_docker_opts or []),
     )
-    if env_template_plan is not None or prepared_model(recipe.model, host_list[0]) is not None:
+    if env_template_plan is not None or prepared_model(recipe.model, host_list[0]) is not None or (_preflight_local_model and not dry_run):
         from sparkrun.orchestration.primitives import build_volumes, resolved_model_volume
 
         template_volumes = build_volumes(
@@ -2132,7 +2151,7 @@ def launch_inference(
                 **resolved_model_volume(recipe),
             },
         )
-        if not dry_run and prepared_model(recipe.model, host_list[0]) is not None:
+        if not dry_run and (prepared_model(recipe.model, host_list[0]) is not None or _preflight_local_model):
             from sparkrun.models.runtime import verify_workload_access
 
             verify_workload_access(
@@ -2142,6 +2161,8 @@ def launch_inference(
                 template_volumes,
                 ssh_kwargs,
                 extra_opts=(runtime.get_extra_docker_opts() or []) + (extra_docker_opts or []),
+                local_model_path=_preflight_local_model,
+                local_model_format=_local_model_format,
             )
         if env_template_plan is not None:
             for host in host_list:

@@ -25,12 +25,14 @@ from __future__ import annotations
 
 from sparkrun.core.operation import submit as _operation_submit
 
+import ipaddress
 import logging
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Callable, TypedDict
+from typing import TYPE_CHECKING, Callable, TypedDict, TypeVar
 
 from sparkrun.api.setup._errors import RdmaTestError
 from sparkrun.api.setup._rdma_plan import RdmaCoverage, plan_rdma_tests
@@ -75,6 +77,44 @@ _progress = logging.getLogger("sparkrun.progress")
 def _say(msg: str, *args) -> None:
     """Emit one progress line (lazy %-formatting, per the logging convention)."""
     _progress.log(PROGRESS, msg, *args)
+
+
+_T = TypeVar("_T")
+
+#: Seconds between "still running" lines while a step is silent.
+HEARTBEAT_INTERVAL_S = 30.0
+
+
+def _with_heartbeat(label: str, fn: Callable[[], _T], *, budget_s: int | None = None, interval_s: float = HEARTBEAT_INTERVAL_S) -> _T:
+    """Run *fn*, emitting a progress line every *interval_s* until it returns.
+
+    The image fetch and the collective each capture their output until they
+    finish, so without this they print one line and then nothing for minutes.
+    A collective stuck in ``MPI_Init`` and one moving 16 GB look the same
+    from outside, and the user Ctrl-Cs a run that was about to finish. The
+    elapsed time, and the budget when there is one, separates them.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = _operation_submit(pool, copy_context().run, fn)
+    start = time.monotonic()
+    try:
+        while True:
+            try:
+                result = future.result(timeout=interval_s)
+            except TimeoutError:
+                elapsed = int(time.monotonic() - start)
+                if budget_s:
+                    _say("  %s: still running (%ds elapsed, gives up at %ds)", label, elapsed, budget_s)
+                else:
+                    _say("  %s: still running (%ds elapsed)", label, elapsed)
+                continue
+            pool.shutdown(wait=True)
+            return result
+    except BaseException:
+        # Ctrl-C reaches the ssh child through the terminal's process group;
+        # waiting here would only hold the interrupt until it exits anyway.
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
 
 
 __all__ = [
@@ -622,8 +662,18 @@ def _run_pairs(
     original candidate order, regardless of completion order. On an exception,
     the pool drains active work before the caller can tear down containers.
     """
+    total = len(pairs)
+    finished = 0
+
+    def _done(pair: RdmaPair, result: PairTestResult) -> PairTestResult:
+        nonlocal finished
+        finished += 1
+        if total > 1:
+            _say("[%d/%d] %s <-> %s: %s", finished, total, pair.host_a, pair.host_b, result.status.upper())
+        return result
+
     if parallel_pairs == 1 or len(pairs) < 2:
-        return tuple(run_pair(pair) for pair in pairs)
+        return tuple(_done(pair, run_pair(pair)) for pair in pairs)
     batches = pair_test_rounds(pairs)
     busy: set[str] = set()
     results: dict[tuple[str, str], PairTestResult] = {}
@@ -649,7 +699,7 @@ def _run_pairs(
             for future in done:
                 pair = active.pop(future)
                 busy.difference_update(pair.key)
-                results[pair.key] = future.result()
+                results[pair.key] = _done(pair, future.result())
     return tuple(results[pair.key] for pair in pairs)
 
 
@@ -977,13 +1027,70 @@ def _nccl_env(host: str, pairs: list[RdmaPair], facts: dict[str, RdmaHostFacts],
             if link.host_b == host and link.hca_b not in hcas:
                 hcas.append(link.hca_b)
 
-    env = {"NCCL_IB_DISABLE": "0", "NCCL_DEBUG": "WARN"}
+    # HWLOC_COMPONENTS=-gl: hwloc's GL component probes local X displays, and
+    # with --network host a desktop session's X server answers, so every rank
+    # on such a host printed "Authorization required, but no authorization
+    # protocol specified" into the report.
+    env = {"NCCL_IB_DISABLE": "0", "NCCL_DEBUG": "WARN", "HWLOC_COMPONENTS": "-gl"}
     if hcas:
         env["NCCL_IB_HCA"] = ",".join(hcas)
     det = detections.get(host)
     if det is not None and getattr(det, "mgmt_iface", ""):
         env["NCCL_SOCKET_IFNAME"] = det.mgmt_iface
     return env
+
+
+def _nccl_failure_detail(output: str, rc: int, timeout: int) -> str:
+    """Name the failure when the output says what it was, else the exit code."""
+    if rc == 124:
+        return "collective timed out after %ds with no result (rc=124)" % timeout
+    if "out of memory" in output:
+        return "collective ran out of GPU memory (rc=%d); free memory on the hosts (sparkrun setup clear-cache) or lower --size" % rc
+    return "collective %s (rc=%d)" % ("failed" if rc else "produced no bus-bandwidth figure", rc)
+
+
+def _mpi_tcp_if_include(hosts: list[str], detections: dict) -> str | None:
+    """The network Open MPI's own TCP traffic should be pinned to, if one is known.
+
+    Open MPI advertises every local address for its out-of-band and TCP BTL
+    traffic. A host running docker networks (``br-*`` bridges on 172.x) offers
+    addresses no peer can route to, and ``MPI_Init`` blocks on them until the
+    collective's timeout fires, with no output at all.
+
+    The management subnet is preferred over an interface name because
+    ``*_if_include`` refuses names that do not exist on a host. Each host's
+    subnet is the most specific routed subnet containing its management IP;
+    they must all agree. Otherwise a management interface name shared by
+    every host is used. Otherwise ``None`` (unpinned, the previous behavior),
+    since a list naming a subnet a host lacks makes Open MPI warn on that host.
+    """
+    cidrs: set[str] = set()
+    names: set[str] = set()
+    for host in hosts:
+        det = detections.get(host)
+        names.add(getattr(det, "mgmt_iface", "") or "")
+        cidr = ""
+        try:
+            ip = ipaddress.ip_address(getattr(det, "mgmt_ip", "") or "")
+        except ValueError:
+            ip = None
+        if ip is not None:
+            best = None
+            for raw in getattr(det, "used_subnets", ()) or ():
+                try:
+                    net = ipaddress.ip_network(raw, strict=False)
+                except ValueError:
+                    continue
+                if ip in net and (best is None or net.prefixlen > best.prefixlen):
+                    best = net
+            cidr = str(best) if best is not None else ""
+        cidrs.add(cidr)
+    if len(cidrs) == 1 and "" not in cidrs:
+        return cidrs.pop()
+    if len(names) == 1 and "" not in names:
+        return names.pop()
+    logger.debug("not pinning mpirun TCP traffic: management subnets %s, interfaces %s disagree", cidrs, names)
+    return None
 
 
 def _run_nccl(
@@ -1038,7 +1145,22 @@ def _run_nccl(
             raw="\n".join((r.stderr or "").strip() for r in installs if not r.success)[:2000],
         )
 
-    _say("Running NCCL %s (%s) across %d host(s) via mpirun...", binary, msg_size, len(hosts))
+    # The collective allocates its buffers in unified memory, where the page
+    # cache is not reclaimed for cudaMalloc: a host whose cache had filled
+    # free memory failed with "Test CUDA failure ... out of memory" even at a
+    # 64M message. The launch path drops the cache for the same reason.
+    from sparkrun.orchestration.primitives import try_clear_page_cache
+
+    try_clear_page_cache(list(hosts), ssh_kwargs=ssh_kwargs)
+
+    tcp_if_include = _mpi_tcp_if_include(hosts, detections)
+    _say(
+        "Running NCCL %s (%s) across %d host(s) via mpirun%s...",
+        binary,
+        msg_size,
+        len(hosts),
+        " (MPI traffic on %s)" % tcp_if_include if tcp_if_include else "",
+    )
     env = _nccl_env(head, pairs, facts, detections)
     cmd = build_nccl_test_cmd(
         list(hosts),
@@ -1046,17 +1168,22 @@ def _run_nccl(
         binary=binary,
         msg_size=msg_size,
         env=env,
+        tcp_if_include=tcp_if_include,
     )
     exported = " ".join("%s=%s" % (k, quote(v)) for k, v in sorted(env.items()))
     full = "export %s; %s" % (exported, cmd) if exported else cmd
 
-    runs = _run_commands(
-        head,
-        [full],
-        ssh_kwargs,
-        container=CONTAINER_NAME,
-        timeout=timeout,
-        retries=0,
+    runs = _with_heartbeat(
+        "NCCL %s" % binary,
+        lambda: _run_commands(
+            head,
+            [full],
+            ssh_kwargs,
+            container=CONTAINER_NAME,
+            timeout=timeout,
+            retries=0,
+        ),
+        budget_s=timeout,
     )
     output, rc = runs.get(0, ("", -1))
     sample = parse_nccl_busbw(output)
@@ -1066,7 +1193,7 @@ def _run_nccl(
             binary=binary,
             msg_size=msg_size,
             status=STATUS_FAIL,
-            detail="collective %s (rc=%d)" % ("failed" if rc else "produced no bus-bandwidth figure", rc),
+            detail=_nccl_failure_detail(output, rc, timeout),
             raw=_clip(output),
         )
     return NcclTestResult(
@@ -1102,6 +1229,7 @@ def rdma_test(
     link_type: str | None = "IB",
     force_container: bool = False,
     keep_containers: bool = False,
+    offline: bool | None = None,
     dry_run: bool = False,
 ) -> RdmaTestReport:
     """Verify RDMA bandwidth, latency and (optionally) a NCCL collective.
@@ -1131,6 +1259,9 @@ def rdma_test(
         link_type: perftest ``--force-link``; ``None`` to omit.
         force_container: Use the image even when perftest is on the host.
         keep_containers: Leave containers running for debugging.
+        offline: ``True`` / ``False`` for ``--offline`` / ``--online``; ``None``
+            follows the cluster's ``offline:`` setting. Offline, the test image
+            is only copied from where it already exists, never pulled.
         dry_run: Resolve and plan without running anything.
 
     Returns:
@@ -1141,12 +1272,14 @@ def rdma_test(
         RdmaTestError: Invalid arguments, or required containers could not be
             prepared. Discovery and coverage failures are returned in the report.
     """
+    from sparkrun.core.offline import resolve_offline
     from sparkrun.orchestration.networking import detect_cx7_for_hosts
 
     if suite not in ALL_SUITES:
         raise RdmaTestError("unknown suite %r (expected %s)" % (suite, ", ".join(ALL_SUITES)))
 
     config = getattr(sctx, "config", None)
+    offline_mode = resolve_offline(offline, cluster)
 
     # Enforced here rather than in the CLI so every caller passes the same
     # gate (the sidecar reaches this function directly), and *before* the
@@ -1241,7 +1374,16 @@ def rdma_test(
     container: str | None = None
     try:
         if need_container:
-            _prepare_container(host_list, resolved_image, ssh_kwargs, need_gpu=wants_nccl, mount_ssh=wants_nccl)
+            _prepare_container(
+                host_list,
+                resolved_image,
+                ssh_kwargs,
+                need_gpu=wants_nccl,
+                mount_ssh=wants_nccl,
+                config=config,
+                cluster=cluster,
+                offline=offline_mode.offline,
+            )
             container = CONTAINER_NAME
 
         if wants_perftest:
@@ -1283,6 +1425,26 @@ def rdma_test(
     return report
 
 
+def _operation_config(config, cluster: ClusterDefinition | None, ssh_kwargs: dict):
+    """The cluster-scoped config image distribution runs under, matching *ssh_kwargs*.
+
+    Distribution builds its SSH settings from a config rather than taking
+    them, so the config must name the user the probes and tests use (an
+    explicit ``--user`` outranks the cluster's ``user:``). Otherwise the image
+    would be fetched as one user and the containers started as another.
+    """
+    from copy import copy
+
+    from sparkrun.orchestration.primitives import build_ssh_kwargs
+
+    scoped = config.for_cluster(cluster)
+    user = ssh_kwargs.get("ssh_user")
+    if user and build_ssh_kwargs(scoped).get("ssh_user") != user:
+        scoped = copy(scoped)
+        scoped.ssh_user = user
+    return scoped
+
+
 def _prepare_container(
     host_list: list[str],
     image: str,
@@ -1290,21 +1452,67 @@ def _prepare_container(
     *,
     need_gpu: bool,
     mount_ssh: bool,
+    config=None,
+    cluster: ClusterDefinition | None = None,
+    offline: bool = False,
 ) -> None:
-    """Sync the image and start the container everywhere, or raise."""
-    from sparkrun.containers.sync import sync_image_to_hosts
+    """Distribute the image and start the container everywhere, or raise.
 
-    _say("Fetching %s on %d host(s) (first run pulls ~1 GB per host)...", image, len(host_list))
-    sync_failed = sync_image_to_hosts(
-        image,
-        list(host_list),
-        ssh_user=ssh_kwargs.get("ssh_user"),
-        ssh_key=ssh_kwargs.get("ssh_key"),
-    )
-    if sync_failed:
-        raise RdmaTestError(
-            "Could not fetch %s on: %s. Pull it manually or point --image at a reachable mirror." % (image, ", ".join(sync_failed))
+    The image goes through the same distribution a launch uses: the cluster's
+    transfer mode and interface, registered image-distribution providers (OCI
+    Relay) and offline mode. It used to be pulled by every host from the
+    registry directly, which ignored a ``delegated`` cluster and failed on an
+    air-gapped one that already held the image on the control machine.
+    """
+    from sparkrun.orchestration.distribution import DistributionError, distribute_resources
+
+    _say("Fetching %s on %d host(s) (first run transfers ~1 GB per host)...", image, len(host_list))
+    if config is not None:
+        op_config = _operation_config(config, cluster, ssh_kwargs)
+        transfer_mode = (cluster.transfer_mode if cluster is not None else None) or "auto"
+        try:
+            _with_heartbeat(
+                "image fetch",
+                lambda: distribute_resources(
+                    image,
+                    "",
+                    list(host_list),
+                    str(op_config.hf_cache_dir),
+                    op_config,
+                    dry_run=False,
+                    recipe_name="rdma-test",
+                    transfer_mode=transfer_mode,
+                    transfer_interface=cluster.transfer_interface if cluster is not None else None,
+                    topology=cluster.topology if cluster is not None else None,
+                    offline=offline,
+                ),
+            )
+        except DistributionError as exc:
+            hint = (
+                "Offline: load it on the control machine or a host first (docker pull / docker load)."
+                if offline
+                else "Pull it manually or point --image at a reachable mirror."
+            )
+            raise RdmaTestError("Could not distribute %s: %s. %s" % (image, exc, hint)) from exc
+    else:
+        # A bare context has no config to scope distribution by: every host pulls for itself.
+        from sparkrun.containers.sync import sync_image_to_hosts
+
+        sync_failed = _with_heartbeat(
+            "image fetch",
+            lambda: sync_image_to_hosts(
+                image,
+                list(host_list),
+                ssh_user=ssh_kwargs.get("ssh_user"),
+                ssh_key=ssh_kwargs.get("ssh_key"),
+                ssh_options=ssh_kwargs.get("ssh_options"),
+                offline=offline,
+            ),
         )
+        if sync_failed:
+            raise RdmaTestError(
+                "Could not fetch %s on: %s. Pull it manually or point --image at a reachable mirror." % (image, ", ".join(sync_failed))
+            )
 
     _say("Image ready on all %d host(s)", len(host_list))
 

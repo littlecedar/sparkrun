@@ -78,7 +78,7 @@ def _import_package(module: str, package: Path):
     return loaded
 
 
-def load_managed_package(metadata: PluginMetadata, package: Path, v, *, source_path: Path):
+def load_managed_package(metadata: PluginMetadata, package: Path, v, *, source_path: Path, source_kind: str = "external"):
     from sparkrun.core.plugin_identity import PluginIdentity, normalize_plugin_id
 
     prefix = metadata.module + "."
@@ -91,8 +91,8 @@ def load_managed_package(metadata: PluginMetadata, package: Path, v, *, source_p
             partial(_import_package, metadata.module, package),
             v,
             tier=DeclarationTier.OUT_OF_TREE,
-            source=("external", metadata.module, str(source_path)),
-            identity=PluginIdentity(normalize_plugin_id(metadata.name), metadata.module, ("external", metadata.module, str(source_path))),
+            source=(source_kind, metadata.module, str(source_path)),
+            identity=PluginIdentity(normalize_plugin_id(metadata.name), metadata.module, (source_kind, metadata.module, str(source_path))),
             declarations=metadata.declarations,
             application_profile_api=metadata.application_profile_api,
         )
@@ -118,12 +118,37 @@ def validating_candidate() -> bool:
     return _validation_candidate is not None
 
 
+def managed_source(record: dict):
+    from sparkrun.core.plugin_policy import PluginSource
+
+    trust = record.get("trust", {})
+    if trust.get("granted") is True and trust.get("default_managed") is True:
+        return PluginSource.DEFAULT_MANAGED
+    return PluginSource.EXTERNAL
+
+
+def _has_enabled_default_managed_plugin(config) -> bool:
+    """Narrow exception to the default-off directory gate for curated payloads.
+
+    Only a persisted, source-trusted managed record can qualify. The ordinary
+    external policy remains unchanged and explicit global opt-outs still win.
+    """
+    from sparkrun.core.plugin_store import PluginStore
+    from sparkrun.core.plugin_policy import PluginSource
+
+    try:
+        config, records = PluginStore(config).snapshot()
+    except PluginError:
+        return False
+    return any(managed_source(record) is PluginSource.DEFAULT_MANAGED and managed_enabled(record, config) for record in records.values())
+
+
 def managed_enabled(record: dict, config) -> bool:
-    from sparkrun.core.plugin_policy import PluginSource, plugin_state
+    from sparkrun.core.plugin_policy import plugin_state
 
     metadata = record["metadata"]
     legacy = metadata.get("feature") if not metadata.get("declarations") else None
-    return plugin_state(metadata["name"], config, source=PluginSource.EXTERNAL, legacy_feature=legacy).enabled
+    return plugin_state(metadata["name"], config, source=managed_source(record), legacy_feature=legacy).enabled
 
 
 def load_managed_plugins(v, *, config=None):
@@ -134,7 +159,8 @@ def load_managed_plugins(v, *, config=None):
 
     config = config or SparkrunConfig()
     if _validation_candidate is None and (_external_plugins_disabled() or not is_feature_enabled("core.external_plugins", config=config)):
-        return []
+        if not _has_enabled_default_managed_plugin(config):
+            return []
     store = PluginStore(config)
     try:
         config, records = store.snapshot()
@@ -175,7 +201,7 @@ def load_managed_plugins(v, *, config=None):
                     raise PluginError("Plugin ledger and active receipt disagree")
                 source = store.generation_path(name, record["active_generation"])
                 package = source / "payload" / Path(*module_parts(metadata.module))
-            load_managed_package(metadata, package, v, source_path=source)
+            load_managed_package(metadata, package, v, source_path=source, source_kind=managed_source(record).value)
             loaded.append(name)
         except Exception as exc:
             if validating:
@@ -183,7 +209,7 @@ def load_managed_plugins(v, *, config=None):
             from sparkrun.core.registration import record_plugin_load_failure
 
             source = store.generation_path(name, record["active_generation"])
-            record_plugin_load_failure(("external", record["metadata"]["module"], str(source)), exc)
+            record_plugin_load_failure((managed_source(record).value, record["metadata"]["module"], str(source)), exc)
             logger.warning("Cannot load managed plugin %s: %s", name, exc)
     return loaded
 
@@ -195,7 +221,8 @@ def managed_plugin_identities(config, records=None):
     from sparkrun.core.plugin_store import PluginStore
 
     if _validation_candidate is None and (_external_plugins_disabled() or not is_feature_enabled("core.external_plugins", config=config)):
-        return {}
+        if not _has_enabled_default_managed_plugin(config):
+            return {}
     store = PluginStore(config)
     if records is None:
         try:
@@ -219,12 +246,12 @@ def managed_plugin_identities(config, records=None):
         metadata = record["metadata"]
         module = metadata["module"]
         try:
-            identity = PluginIdentity(normalize_plugin_id(name), module, ("external", module, str(source)))
+            identity = PluginIdentity(normalize_plugin_id(name), module, (managed_source(record).value, module, str(source)))
             declare_plugin_features(identity, metadata.get("declarations", {}))
             if validating or managed_enabled(record, config):
                 identities[name] = identity
         except ValueError as exc:
             from sparkrun.core.registration import record_plugin_load_failure
 
-            record_plugin_load_failure(("external", module, str(source)), exc)
+            record_plugin_load_failure((managed_source(record).value, module, str(source)), exc)
     return identities

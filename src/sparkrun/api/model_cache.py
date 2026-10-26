@@ -23,7 +23,7 @@ from sparkrun.models.artifacts import (
     ModelInventoryUnavailable,
 )
 from sparkrun.models.host_io import ModelHostIO
-from sparkrun.models.cache_reports import CacheReport
+from sparkrun.models.cache_reports import CacheReport, ClaimReconciliation
 from sparkrun.models.manifest import check_request, fetch_inventory, manifest_path, select_manifest
 from sparkrun.models.preparation import PreparedModel, prepare_model
 
@@ -236,14 +236,24 @@ def prune_cache(
     )
 
 
+def _require_revision(request):
+    import re
+
+    if not request.revision or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", request.revision):
+        raise ModelArtifactError("a full model commit or a ref name such as main is required")
+
+
 def pin_revision(
     request, *, cache_dir, hosts=("localhost",), pinned=True, ssh_kwargs=None, session=None, sctx=None
 ) -> tuple[CacheReport, ...]:
-    """Pin/unpin an already tracked immutable revision on selected cache hosts."""
-    from sparkrun.models.cache import cache_operation
-    from sparkrun.models.usage import usage_path
+    """Pin/unpin an already tracked revision on selected cache hosts.
 
-    usage_path("/", request.repo, request.revision)  # Require a full immutable commit.
+    ``request.revision`` is a full commit, or a ref such as ``main`` that each
+    cache resolves through its own ``refs/`` (reports carry the commit).
+    """
+    from sparkrun.models.cache import cache_operation
+
+    _require_revision(request)
     return cache_operation(
         cache_dir=cache_dir,
         hosts=hosts,
@@ -265,11 +275,11 @@ def reconcile_claim(
 
     Normal stop releases exact claims automatically. Never infer inactivity from
     age, a dead controller, an unavailable host, or missing local job metadata.
+    ``request.revision`` may be a ref, resolved per cache as in :func:`pin_revision`.
     """
     from sparkrun.models.cache import cache_operation
-    from sparkrun.models.usage import usage_path
 
-    usage_path("/", request.repo, request.revision)
+    _require_revision(request)
     return cache_operation(
         cache_dir=cache_dir,
         hosts=hosts,
@@ -283,6 +293,182 @@ def reconcile_claim(
         claim=claim,
         confirm_inactive=confirm_inactive,
     )
+
+
+#: Default minimum claim age for :func:`reconcile_claims`. A launch claims its
+#: model before its containers exist, so a young claim with no workload may be
+#: a launch still preparing (possibly from another control machine).
+RECONCILE_MIN_AGE_SECONDS = 3600
+#: Added to every minimum age, including zero. A claim's ``created`` is the
+#: clock of the controller that launched it, which may be another machine's.
+RECONCILE_CLOCK_SKEW_SECONDS = 300
+
+
+def _jobs_on_unswept_executors(swept, sctx):
+    """Recorded workloads launched through an executor the sweep did not query.
+
+    An executor whose feature flag was turned off after a launch is not swept,
+    so its workloads look absent. Returns ``(unswept, recorded)``: workload id
+    to executor for those, and every workload id with a job record here mapped
+    to the executor it records (``None`` when the record does not say).
+    """
+    from sparkrun.api._jobs import list_jobs
+
+    unswept: dict[str, str] = {}
+    recorded: dict[str, str | None] = {}
+    for job in list_jobs(sctx=sctx):
+        executor = (job.metadata or {}).get("executor")
+        recorded[job.workload_id] = executor if isinstance(executor, str) and executor else None
+        if executor and swept and executor not in swept:
+            unswept[job.workload_id] = executor
+    return unswept, recorded
+
+
+def _parse_claim(claim: dict) -> tuple[str, tuple[str, ...], float] | None:
+    """``(workload, hosts, created)`` of a well-formed claim record, else None."""
+    workload, hosts, created = claim.get("workload"), claim.get("hosts"), claim.get("created")
+    if not isinstance(workload, str) or not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+        return None
+    # A bool is an int, and is not a timestamp.
+    if not isinstance(created, (int, float)) or isinstance(created, bool):
+        return None
+    return workload, tuple(hosts), float(created)
+
+
+def _executor_hint(name, gated):
+    """*name*, plus how to make status sweep it when this controller gates it off."""
+    flag = gated.get(name)
+    return name if flag is None else "%s (disabled here; enable %s to sweep it)" % (name, flag)
+
+
+def reconcile_claims(
+    *,
+    cache_dir,
+    hosts=("localhost",),
+    cluster=None,
+    repo=None,
+    dry_run=True,
+    min_age_seconds=RECONCILE_MIN_AGE_SECONDS,
+    ssh_kwargs=None,
+    session=None,
+    sctx=None,
+) -> tuple[ClaimReconciliation, ...]:
+    """Find workload claims whose workload is gone and release them; preview by default.
+
+    A claim is released only when it names a workload of this distribution,
+    one status sweep of *hosts* (through *cluster*'s executors, like
+    ``status``) observed every host in the claim and found the workload
+    running on none of them, the sweep queried the executor the claim records
+    (a claim recording none: no job record here places the workload, or, with
+    no record, any workload, under an executor the sweep could not query, and
+    no executor in the sweep's scope is feature-gated off here), no pending
+    operation on this control machine names it, and the claim is at least
+    *min_age_seconds* old (plus :data:`RECONCILE_CLOCK_SKEW_SECONDS`, since the
+    claim was timestamped by whichever controller launched it). Anything else
+    is reported and kept. Limit to one model with *repo*.
+    """
+    import math
+    import time
+
+    from sparkrun.api._status import status as cluster_status
+    from sparkrun.core.application_profile import get_application_profile
+    from sparkrun.core.ownership import resource_namespace_of
+    from sparkrun.core.pending_ops import list_pending_ops
+    from sparkrun.models.cache import cache_operation, resolve_cache_locations
+    from sparkrun.orchestration.executors._base import gated_off_executors
+
+    if type(min_age_seconds) not in (int, float) or not math.isfinite(min_age_seconds) or min_age_seconds < 0:
+        raise ValueError("minimum claim age must be finite and nonnegative")
+    hosts = tuple(hosts)
+    ssh_kwargs = _ssh(ssh_kwargs, sctx)
+    locations = resolve_cache_locations(cache_dir=cache_dir, hosts=hosts, ssh_kwargs=ssh_kwargs, session=session, verify=not dry_run)
+    reports = cache_operation(
+        cache_dir=cache_dir, hosts=hosts, ssh_kwargs=ssh_kwargs, session=session, locations=locations, action="inventory"
+    )
+    claimed = [(r, e) for r in reports for e in r.entries if e.claims and (repo is None or e.repo == repo)]
+    if not claimed:
+        return ()
+    snapshot = cluster_status(list(hosts), cluster=cluster, sctx=sctx)
+    running = set(snapshot.running_cluster_ids())
+    observed = set(hosts) - set(snapshot.observation_errors)
+    coverage = tuple(getattr(snapshot, "coverage", ()))
+    swept = {c.target.executor for c in coverage}
+    scopes = {c.status_scope for c in coverage}
+    # Executors this controller has turned off are registered but invisible to
+    # status, so their workloads (possibly launched by another controller,
+    # which leaves no record here) would look absent.
+    gated = {name: flag for name, (flag, scope) in gated_off_executors().items() if name not in swept and (not scopes or scope in scopes)}
+    pending = {op.get("job_cluster_id") for op in list_pending_ops()} - {"", None}
+    unswept, recorded = _jobs_on_unswept_executors(swept, sctx)
+    namespace = get_application_profile().resource_namespace
+    now = time.time()
+    results = []
+    for report, entry in claimed:
+        for token, claim in sorted(entry.claims.items()):
+            claim = claim if isinstance(claim, dict) else {}
+            parsed = _parse_claim(claim)
+            workload, claim_hosts, created = parsed or ("", (), 0.0)
+            claim_executor = claim.get("executor")
+            unobserved = [h for h in claim_hosts if h not in observed]
+            if parsed is None:
+                status, reason = "unverified", "malformed claim record"
+            elif resource_namespace_of(workload) != namespace:
+                # Status reports only this distribution's workloads, so another
+                # distribution's live workload would look absent.
+                status, reason = "foreign", "workload belongs to another distribution or has an unrecognized id"
+            elif workload in running:
+                status, reason = "running", "workload is running"
+            elif not claim_hosts or unobserved:
+                status, reason = "unverified", "not observed: " + (", ".join(unobserved) or "claim names no hosts")
+            elif isinstance(claim_executor, str) and claim_executor not in swept:
+                status, reason = "unverified", "its executor was not swept: " + _executor_hint(claim_executor, gated)
+            elif (
+                not isinstance(claim_executor, str)
+                and recorded.get(workload) not in swept
+                and (workload in unswept or (unswept and workload not in recorded) or gated)
+            ):
+                # A claim that does not name its executor (written before claims
+                # recorded one) may be under any of these. A job record here
+                # naming a swept executor settles it: without that, executor.local
+                # being off on stable would keep every older claim unverified.
+                names = {unswept[workload]} if workload in unswept else {*unswept.values(), *gated}
+                status, reason = (
+                    "unverified",
+                    "may run under an executor this sweep could not query: " + ", ".join(_executor_hint(n, gated) for n in sorted(names)),
+                )
+            elif workload in pending:
+                status, reason = "preparing", "a pending operation on this machine names the workload"
+            elif now - created < min_age_seconds + RECONCILE_CLOCK_SKEW_SECONDS:
+                status, reason = "recent", "younger than the minimum age; a launch may still be preparing"
+            else:
+                status, reason = "orphaned", "workload absent from every claimed host"
+            action = None
+            if status == "orphaned":
+                action = "would_release"
+                if not dry_run:
+                    try:
+                        cache_operation(
+                            cache_dir=cache_dir,
+                            ssh_kwargs=ssh_kwargs,
+                            session=session,
+                            locations=(report.location,) if report.location is not None else None,
+                            hosts=(report.host,),
+                            action="reconcile",
+                            dry_run=False,
+                            repo=entry.repo,
+                            revision=entry.revision,
+                            claim=token,
+                            confirm_inactive=True,
+                        )
+                        action = "released"
+                    except (ModelArtifactError, ValueError, OSError) as exc:
+                        action, reason = "failed", str(exc)
+            results.append(
+                ClaimReconciliation(
+                    entry.repo, entry.revision, token, workload, claim_hosts, created, status, reason, action, report.location
+                )
+            )
+    return tuple(results)
 
 
 def adopt_cache(

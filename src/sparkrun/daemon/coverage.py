@@ -57,6 +57,7 @@ EXCLUSIONS = {
     "setup.validate_cx7_options": "Pure option check that plan_cx7 applies itself.",
     "setup.diagnose_ssh": "Requires a terminal-owned ssh password conversation; use setup ssh --diagnose in a terminal.",
     "setup.find_local_public_key": "Reads the caller's own ssh configuration; diagnose_ssh reports the result.",
+    "model_cache.reconcile_claims": "Composes status with model_cache.list and model_cache.reconcile; use the CLI or Python API.",
 }
 K8S_OPERATIONS = {
     name: "plugins.k8s." + name

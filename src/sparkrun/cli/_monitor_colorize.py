@@ -20,9 +20,12 @@ verified against the engines' own sources:
 * TRT-LLM     ``[10/11/2026-08:12:34 UTC] [E] rank 1 exited`` and glog ``E1011 08:12:34.123 …``
 * NCCL        ``dgx01:28971 [0] NCCL INFO Ring ALGO`` (sparkrun sets NCCL_DEBUG=INFO)
 * Atlas       ``[2026-10-11T08:12:34Z WARN atlas::serve] …`` (Rust env_logger) and tracing
-* TensorFold  ``[tensorfold] {message}`` with NO level token (zig/src/server/log.zig): ``warning: …``,
-              ``refused …``, ``ended … reason=error (…)…``, ``done req-…``, and access lines
-              ``ip "GET …" 4xx/5xx -``; fatals ``tensorfold: {s}`` on stderr (main.zig fail()).
+* TensorFold  ``[tensorfold] {message}`` with NO level token (zig/src/server/log.zig):
+              ``warning: …``, ``refused …``, ``engine ready``, ``serving … at http://…``,
+              ``done … finish=stop|length …``, ``ended … reason=client-left|error …``, and
+              access lines ``ip "GET …" 4xx/5xx -``; fatals ``tensorfold: {s}`` on stderr
+              (main.zig fail()); the launcher prefixes its own lines ``[tensorfold-launcher]``.
+              Shapes verified against a real workload log, 2026-10-17.
 
 Styles are plain Rich style strings, and nothing here imports ``rich`` or ``textual``,
 so every rule unit-tests without a terminal.
@@ -184,6 +187,7 @@ _PHASE_RULES: tuple[Rule, ...] = (
     _re_rule(r"\bgen throughput\b", STYLE_DECODE),  # SGLang decode batch: "gen throughput (token/s)"
     _re_rule(r"\bprompt eval time\b", STYLE_PREFILL),  # llama.cpp prefill block
     _re_rule(r"\beval time\b", STYLE_DECODE),  # llama.cpp generation block; the prompt pair is claimed above
+    _re_rule(r"\bprompt processing\b", STYLE_PREFILL),  # llama.cpp live prefill line ("prompt processing, n_tokens = …")
     _re_rule(r"\b[Pp]refill\b", STYLE_PREFILL),  # SGLang/TRT-LLM "Prefill batch"
     _re_rule(r"\b[Dd]ecode\b", STYLE_DECODE),  # SGLang "Decode batch"
 )
@@ -327,20 +331,34 @@ class AtlasColorizer(LogColorizer):
 
 
 class TensorFoldColorizer(LogColorizer):
-    """TensorFold (ashhart/TensorFold, zig/src/server/log.zig): every server line is
-    ``[tensorfold] {message}`` with no level token, so its rules anchor to the prefix;
-    ``tensorfold: {s}`` startup fatals on stderr (main.zig) color whole-line. ``done`` is
-    a success-status token, so it gets green — one color beyond the level palette.
+    """TensorFold (ashhart/TensorFold): server lines are ``[tensorfold] {message}`` with no
+    level token (zig/src/server/log.zig), the launcher's are ``[tensorfold-launcher] …``, so
+    its rules anchor to those prefixes; ``tensorfold: {s}`` startup fatals on stderr
+    (main.zig) color whole-line. Outcome tokens keep their semantics: ``done``/``engine
+    ready`` green, ``finish=length`` (reply hit the token limit) yellow, ``reason=client-left``
+    dim (a normal client cancellation) while ``reason=error`` stays severe. Verified against a
+    real workload log, 2026-10-17.
     """
 
     name = "tensorfold"
-    signature = re.compile(r"^\[tensorfold\] |^tensorfold: ")
+    signature = re.compile(r"^\[tensorfold\] |^tensorfold: |^\[tensorfold-launcher\] ")
     own_rules = (
         _whole_line_rule(r"^tensorfold: ", STYLE_SEVERE),
+        _re_rule(r"^\[tensorfold-launcher\]", STYLE_PROCESS),
         _re_rule(r"(?<=\[tensorfold\] )warning:", STYLE_WARN),
         _re_rule(r"(?<=\[tensorfold\] )refused(?=\s)", STYLE_SEVERE),
+        _re_rule(r"(?<=\[tensorfold\] )engine ready\b", STYLE_OK),
+        _re_rule(r"(?<=\[tensorfold\] )serving(?= .* at http)", STYLE_OK),
         _re_rule(r"\breason=error\b", STYLE_SEVERE),
+        _re_rule(r"\breason=client-left\b", "dim"),
         _re_rule(r"(?<=\[tensorfold\] )done(?=\s)", STYLE_OK),
+        _re_rule(r"\bfinish=stop\b", STYLE_OK),
+        _re_rule(r"\bfinish=length\b", STYLE_WARN),
+        # One data span for the spec-decode ratio: the generic key=value rule
+        # would claim only the numerator ("accepted=11" of "accepted=11/23").
+        _re_rule(r"\baccepted=\d+/\d+\b", STYLE_DATA),
+        # The completion hash: hex, so the digit-starting key=value rule misses it.
+        _re_rule(r"\bsha=[0-9a-f]{6,}\b", STYLE_ID),
     )
 
 

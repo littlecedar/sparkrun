@@ -174,6 +174,9 @@ def _ensure_ssh_access(host_list, user, config, dry_run=False, yes=False):
                 click.echo("  Warning: could not persist ssh.key: %s" % e, err=True)
     else:
         click.echo("  Using SSH key: %s" % local_key.path)
+    # The re-probe must offer the key being installed: ``ssh_key`` was read from
+    # config before this key existed, so on a fresh controller it is ``None``.
+    ssh_key = str(local_key.path)
 
     click.echo()
     click.echo("Installing the public key on %d host(s)." % len(auth_failed))
