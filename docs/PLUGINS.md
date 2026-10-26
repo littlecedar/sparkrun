@@ -67,6 +67,65 @@ already satisfied by the host. Both top-level packages and
 payloads, conflicting providers, and unsupported layouts are rejected. Package
 resources and declared license files are preserved.
 
+## Default plugins
+
+An application can ship a catalog of optional external plugins to install
+automatically when missing. **Sparkrun's built-in catalog is currently empty.**
+Application authors declare `DefaultPlugin` entries in
+`ApplicationProfile.default_plugins`; see [application profiles](APPLICATION_PROFILES.md#default-plugins).
+Each entry identifies the plugin name, module, Git source, tracking ref, and
+whether the application trusts that source. Untrusted entries require explicit
+installation with `plugins add`; declaring a name alone never grants trust.
+
+Normal application initialization installs missing trusted defaults before
+loading plugins. `sparkrun update` and `plugins update --all` also fill missing
+defaults. Installation failures are reported individually and do not prevent
+unrelated plugins or ordinary commands from working. Retry explicitly with:
+
+```sh
+sparkrun plugins sync --dry-run --json  # local preview; no network or execution
+sparkrun plugins sync                  # install missing defaults only
+sparkrun setup plugins sync            # equivalent alias
+```
+
+Existing providers, including disabled or unmanaged installations, take
+precedence. Reconciliation never replaces a user's source or pin. Once
+installed, defaults use the usual compatibility checks, generations, updates,
+and rollback. Their inventory source is `default-managed`. Removing an entry
+from the catalog does not uninstall existing copies.
+
+First-time provisioning runs the plugin's installation hook through the same
+isolated validation and transaction as `plugins add`. Subsequent startup does
+not run lifecycle hooks. Automatic installation does not run an explicit
+enable hook or select a gateway.
+
+`plugins disable NAME` works even before a declared default is installed.
+`plugins remove NAME` records a persistent removal opt-out, so initialization
+and updates cannot reinstall it. `plugins enable NAME` clears that opt-out;
+for a missing default, run `plugins sync` or initialize again to install it.
+Explicit `plugins add` also clears a removal opt-out without changing loading
+overrides unless `--enable` is supplied.
+
+To prevent all automatic default installation, set:
+
+```yaml
+plugins:
+  defaults:
+    enabled: false
+```
+
+`SPARKRUN_NO_DEFAULT_PLUGINS=1` provides the same provisioning opt-out for a
+process. These settings leave already installed plugins available; use
+`plugins disable` to stop loading them. `SPARKRUN_NO_EXTERNAL_PLUGINS` and an
+explicit false `core.external_plugins` override block default installation and
+loading. Trusted defaults do not enable `core.external_plugins` or activate
+existing `plugins.paths`. Their recipe-registry declarations still have the
+out-of-tree trust tier.
+
+Completion, plugin listing, validation/hook subprocesses, and
+`update --no-update-plugins` never provision defaults. The console-free API is
+`sparkrun.api.plugins.sync_defaults(config=..., dry_run=...)`.
+
 ## Updating Sparkrun and compatibility
 
 Both `sparkrun update` and `sparkrun setup update` check every plugin's declared
@@ -94,8 +153,9 @@ an audit, not repairs. An older core without the reconciliation helper reports
 that the audit is incomplete.
 
 The same compatibility evaluator is used by add, update, rollback, list, and core
-updates. Ordinary startup performs no new version-range/dependency audit or
-network update. Existing feature, plugin API, and application-profile guards
+updates. Ordinary startup leaves existing installations unchanged, without a
+new version-range/dependency audit or network update; missing default plugins
+are installed and validated as described above. Existing feature, plugin API, and application-profile guards
 still apply. Missing declarations are reported as unknown rather than assumed
 compatible. The opt-out does not check whether an update is available.
 

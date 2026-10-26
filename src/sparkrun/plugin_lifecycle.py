@@ -1,9 +1,10 @@
 """Public plugin lifecycle planning API, version 1.
 
-Handlers run only for explicit management actions, in a bounded child process.
+Handlers run for management actions, in a bounded child process.
 They return configuration changes, never save files, start services or prompt.
 Core validates and commits the plan. Repeated explicit enable requests invoke
-handlers again; handlers must be idempotent. Startup never calls these hooks.
+handlers again; handlers must be idempotent. Startup only runs installation
+hooks when provisioning a missing default, never for already installed plugins.
 """
 
 from __future__ import annotations

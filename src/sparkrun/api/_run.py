@@ -1068,6 +1068,7 @@ def _evict_superseded_deployments(
         only the latter makes deletion safe.
     """
     import sparkrun.api as api
+    from sparkrun.core.application_profile import resource_name
     from sparkrun.orchestration.executor import query_status_for_cluster
     from sparkrun.orchestration.primitives import build_ssh_kwargs
 
@@ -1076,6 +1077,7 @@ def _evict_superseded_deployments(
             cluster_def,
             list(candidate_hosts),
             ssh_kwargs=build_ssh_kwargs(config) if config else {},
+            host_hardware=cluster_def.hosts_hardware or None,
             config=config,
             v=sctx.variables if sctx is not None else None,
         )
@@ -1088,14 +1090,17 @@ def _evict_superseded_deployments(
     if strict and status.observation_errors:
         raise RuntimeError("could not query cluster status before workload replacement: %s" % status.observation_errors)
 
-    prefix = "sparkrun_%s_" % intent_id
+    prefix = resource_name("_%s_" % intent_id)
     target = set(target_hosts)
     # cluster_id -> every host in the snapshot it occupies (insertion-ordered).
     occupied: dict[str, list[str]] = {}
     overlapping: list[str] = []
+    current_hosts: set[str] = set()
     for entry in status.hosts:
         for workload in entry.workloads:
             cid = workload.cluster_id
+            if cid == cluster_id_for_launch:
+                current_hosts.add(entry.host)
             if cid == cluster_id_for_launch and not include_current:
                 continue
             if workload.intent_id != intent_id and not cid.startswith(prefix):
@@ -1131,7 +1136,55 @@ def _evict_superseded_deployments(
                 ", ".join(result.hosts_failed),
             )
         evicted.append(cid)
+    if not include_current:
+        # With include_current the earlier launch went through api.stop above,
+        # which releases its claims itself.
+        try:
+            _retire_replaced_launch_claims(cluster_id_for_launch, status, current_hosts, config=config, sctx=sctx)
+        except Exception:
+            logger.warning(
+                "Could not release the model cache claims of the launch %s replaces; stop it to release them",
+                cluster_id_for_launch,
+                exc_info=True,
+            )
     return evicted, status.observation
+
+
+def _retire_replaced_launch_claims(cluster_id, status, running_hosts, *, config, sctx) -> None:
+    """Release an earlier same-id launch's cache claims on hosts it has left.
+
+    A relaunch under the same id (an ``export systemd`` unit restarting) never
+    stops the earlier launch, and ``save_job_metadata`` carries its claims
+    forward, so without this every restart adds a claim that only an explicit
+    stop releases and the revisions they pin are never pruned.  A claim is
+    released only on a host this sweep observed through the executor the
+    earlier launch recorded, with the workload not running there.  Where it
+    still runs, the runtime replaces its containers by name without
+    confirmation, so the claim is kept.
+    """
+    from sparkrun.models.usage import release_claims
+    from sparkrun.orchestration.job_metadata import forget_model_cache_claims, load_job_metadata
+    from sparkrun.orchestration.primitives import build_ssh_kwargs
+
+    cache_dir = str(config.cache_dir) if config is not None else None
+    meta = load_job_metadata(cluster_id, cache_dir=cache_dir, sctx=sctx) or {}
+    claims = [ref for ref in meta.get("model_cache_claims") or () if isinstance(ref, dict) and isinstance(ref.get("host"), str)]
+    executor = meta.get("executor")
+    if not claims or not executor:
+        return
+    observed = {host for coverage in status.coverage if coverage.target.executor == executor for host in coverage.hosts} - set(
+        status.observation_errors
+    )
+    gone = {ref["host"] for ref in claims} & observed - set(running_hosts)
+    if not gone:
+        return
+    connection = build_ssh_kwargs(config) if config is not None else {}
+    if meta.get("ssh_user"):
+        connection["ssh_user"] = meta["ssh_user"]
+    released = [ref for ref in claims if ref["host"] in gone]
+    release_claims(released, hosts=gone, ssh_kwargs=connection)
+    forget_model_cache_claims(cluster_id, released, cache_dir=cache_dir, sctx=sctx)
+    logger.info("Released model cache claims of the replaced launch of %s on %s", cluster_id, ", ".join(sorted(gone)))
 
 
 def replace_intent_deployments(

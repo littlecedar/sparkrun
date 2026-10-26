@@ -1,4 +1,4 @@
-"""Isolated hook runner. No lifecycle code executes during normal bootstrap."""
+"""Isolated hook runner, including installation of missing application defaults."""
 
 from __future__ import annotations
 import importlib
@@ -23,7 +23,10 @@ def main():
     configuration._lifecycle_snapshot = (Path(request["config_path"]).resolve(), request["config"])
     if request.get("metadata"):
         metadata = PluginMetadata.from_dict(request["metadata"])
-        managed._validation_candidate = ({"metadata": metadata.to_dict()}, Path(request["package"]))
+        record = {"metadata": metadata.to_dict()}
+        if request.get("default_managed") is True:
+            record["trust"] = {"granted": True, "default_managed": True}
+        managed._validation_candidate = (record, Path(request["package"]))
     config = SparkrunConfig(request["config_path"])
     init_sparkrun(config=config)
     if "inspect_feature" in request:

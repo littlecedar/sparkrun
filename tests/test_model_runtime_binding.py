@@ -77,6 +77,21 @@ def test_custom_command_cannot_load_unvalidated_revision(binding_scope, tmp_path
         validate_runtime_command(recipe, overrides, runtime, recipe.command)
 
 
+def test_local_model_keeps_revision_from_validated_manifest(tmp_path, binding_scope):
+    from sparkrun.models.preparation import validate_preplaced
+
+    manifest = artifact()
+    root = cache(tmp_path, manifest)
+    (root / ".sparkrun-model-manifest.json").write_text(manifest.to_json())
+    validate_preplaced(str(root), ["localhost"])
+    recipe = Recipe.from_dict({"model": str(root), "runtime": "sglang", "container": "test", "env": {"REV": "{launch.model_revision}"}})
+    executor = DockerExecutor()
+    overrides = {}
+    bind_runtime_models(recipe, overrides, SglangRuntime(), ["localhost"], {"localhost": executor}, {str(root): "/model"})
+    plan = prepare_env_templates(recipe, overrides, ["localhost"], "job", str(tmp_path), {})
+    assert plan.render("localhost", {str(root): "/model"}, None, executor) == {"REV": SHA}
+
+
 @pytest.fixture
 def prepared_command(binding_scope, tmp_path):
     bind(tmp_path)

@@ -90,8 +90,8 @@ def recipe_list(ctx, registry, runtime, show_all, output_json, query):
     """
     from sparkrun.utils.cli_formatters import format_recipe_table
 
-    # unique_names: `list` is the "what can I type?" view, so a name resolves
-    # to exactly one row.  `search` shows every registry's copy instead.
+    # List keeps the first ordinary short name and every distinct path variant.
+    # Search deliberately keeps every copy across registries.
     recipes, _registry, _query = _search_recipes(ctx, query, registry=registry, runtime=runtime, show_all=show_all, unique_names=True)
 
     if output_json:

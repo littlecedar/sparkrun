@@ -196,3 +196,17 @@ def test_quick_selection_handles_different_members_on_each_subnet():
         ("h1", "h3", "10.1.0.0/24"),
         ("h3", "h4", "10.1.0.0/24"),
     }
+
+
+def test_pair_completion_is_counted_as_pairs_finish(caplog):
+    caplog.set_level(25, logger="sparkrun.progress")
+    pairs = _pairs(("a", "b"), ("c", "d"), ("a", "c"))
+
+    def run(pair):
+        return PairTestResult(pair=pair, status="ok")
+
+    _run_pairs(pairs, run, 2)
+    counted = [m for m in caplog.messages if m.startswith("[")]
+    assert len(counted) == 3
+    assert counted[-1].startswith("[3/3]")
+    assert all(m.endswith(": OK") for m in counted)

@@ -236,25 +236,24 @@ def prepare_model(
         from sparkrun.models.cache import auto_prune
         from sparkrun.models.usage import record_use
 
-        locations = dict.fromkeys([(source_host, source_root), *roots.items()])
+        # Most launches need only their target caches. Do not serialize a warm
+        # launch behind an unrelated control-cache download or multi-minute copy.
+        locations: dict[tuple[str | None, str], None] = dict.fromkeys(roots.items())
         auto_prune(io, locations, config=config, exclude_repos=(request.repo,))
-        # Readers also participate: a warm launch/transfer source must not race
-        # eviction. Hold leases until durable workload claims are published.
-        for host, root in sorted(locations, key=lambda item: (item[0] or "", item[1])):
-            io.lock(host, root, request.repo)
-        # Expected inventory is useful even if repair or transfer later fails.
-        # Persist before observing payloads so a subsequent offline legacy run
-        # cannot forget known requirements and fall back to presence heuristics.
-        for host, root in dict.fromkeys([(source_host, source_root), *roots.items()]):
-            try:
-                _persist_manifest(io, host, root, request, manifest)
-            except ModelArtifactError as exc:
-                logger.warning("Could not persist expected model inventory on %s: %s", host or "control", exc)
-        # Before observing: content a host already holds as HF blobs becomes
-        # hard links here, so it is neither downloaded nor copied again, and a
-        # duplicate copy left by an earlier run is reclaimed. Under the leases.
-        for host, root in dict.fromkeys([(source_host, source_root), *roots.items()]):
-            link_existing_blobs(io, host, root, manifest, checksums=checksums)
+        _prepare_locations(io, locations, request, manifest, checksums=checksums)
+        reports = {host: io.observe(host, manifest, root, checksums=checksums) for host, root in roots.items()}
+        bad = [host for host in hosts if not reports[host].complete]
+        if bad and (source_host, source_root) not in locations and not (transfer_mode == "push" and reports[head].complete):
+            # Never add the control lease while holding target leases: another
+            # cold preparation acquires control first. Drop the healthy leases
+            # and reacquire the full set in order, then repeat reuse/observation
+            # because eviction or another preparation may have run in the gap.
+            io.release_leases()
+            auto_prune(io, [(source_host, source_root)], config=config, exclude_repos=(request.repo,))
+            locations[source_host, source_root] = None
+            _prepare_locations(io, locations, request, manifest, checksums=checksums)
+            reports = {host: io.observe(host, manifest, root, checksums=checksums) for host, root in roots.items()}
+            bad = [host for host in hosts if not reports[host].complete]
         logger.info(
             "Model %s pinned to %s: %d selected files, %.2f GiB",
             model,
@@ -262,16 +261,9 @@ def prepare_model(
             len(manifest.files),
             sum(f.size for f in manifest.files) / 2**30,
         )
-        reports = {host: io.observe(host, manifest, root, checksums=checksums) for host, root in roots.items()}
-        bad = [host for host in hosts if not reports[host].complete]
         if bad:
             for host in bad:
                 _repair_files(reports[host])  # Do not mistake access/SSH failures for missing payload.
-            # Stable ordering and per-repo locks cover overlapping selections.
-            # An operation nonce reuses leases across shared mount/host aliases.
-            locations = {(source_host, source_root), *((host, roots[host]) for host in bad)}
-            for host, root in sorted(locations, key=lambda item: (item[0] or "", item[1])):
-                io.lock(host, root, request.repo)
             if transfer_mode == "pull":
                 require_model_space(io, manifest, [(host, roots[host], _repair_files(reports[host])) for host in bad])
                 for host in bad:
@@ -429,6 +421,21 @@ def prepare_model(
         return PreparedModel(manifest, tuple(bindings))
 
 
+def _prepare_locations(io, locations, request, manifest, *, checksums):
+    # Hold leases until durable workload claims are published. The nonce reuses
+    # leases across shared mount/host aliases; stable ordering avoids inversion.
+    for host, root in sorted(locations, key=lambda item: (item[0] or "", item[1])):
+        io.lock(host, root, request.repo)
+    # Persist known requirements even if a later repair fails, so offline runs
+    # cannot fall back to presence heuristics. Reuse blobs before observing.
+    for host, root in locations:
+        try:
+            _persist_manifest(io, host, root, request, manifest)
+        except ModelArtifactError as exc:
+            logger.warning("Could not persist expected model inventory on %s: %s", host or "control", exc)
+        link_existing_blobs(io, host, root, manifest, checksums=checksums)
+
+
 def _persist_manifest(io, host, root, request, manifest):
     # Store both the requested-ref lookup and immutable lookup. A later pinned
     # recipe/export can reuse inventory learned from an unpinned launch.
@@ -438,15 +445,18 @@ def _persist_manifest(io, host, root, request, manifest):
         io.publish(host, root, request.repo, str(path), contents)
 
 
-def validate_preplaced(model: str, hosts, *, model_path=None, ssh_kwargs=None, checksums=False) -> tuple[ValidatedModelBinding, ...]:
+def validate_preplaced(
+    model: str, hosts, *, model_path=None, ssh_kwargs=None, checksums=False, model_format="auto"
+) -> tuple[ValidatedModelBinding, ...]:
     """Observe explicitly imported inventories beside pre-placed model paths.
 
     A directory carries .sparkrun-model-manifest.json; a GGUF file uses
     <filename>.sparkrun-model-manifest.json and paths relative to its parent.
-    Missing metadata is a visible migration state, never a validated binding.
+    Without metadata, check basic format/readability but do not create a
+    validated binding or claim a known revision or complete inventory.
     """
     from pathlib import PurePosixPath
-    from sparkrun.models.observation import observation_script, parse_observations
+    from sparkrun.models.observation import local_model_probe_script, observation_script, parse_observations
     from sparkrun.utils.shell import quote
 
     bindings = []
@@ -461,6 +471,12 @@ def validate_preplaced(model: str, hosts, *, model_path=None, ssh_kwargs=None, c
             metadata = path + "/.sparkrun-model-manifest.json" if directory else path + ".sparkrun-model-manifest.json"
             text = io.read(host, metadata)
             if text is None:
+                result = io.execute(host, local_model_probe_script(path, model_format), timeout=60)
+                if result.returncode:
+                    raise ModelArtifactError(
+                        "local model preflight failed on %s at %s: %s"
+                        % (host, path, result.stderr.decode(errors="replace").strip()[-1500:])
+                    )
                 logger.warning("Pre-placed model %s on %s is unverified: import expected metadata at %s", model, host, metadata)
                 continue
             manifest = ModelArtifactManifest.from_json(text)

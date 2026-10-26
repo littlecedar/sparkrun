@@ -18,13 +18,15 @@ class PluginSource(StrEnum):
 
     ``EXTERNAL`` covers configured directories and managed plugins: both need
     ``core.external_plugins``. ``INSTALLED`` entry points are off unless
-    selected. An unknown spelling is an error rather than a silent bypass of
-    those gates.
+    selected. ``DEFAULT_MANAGED`` is a persisted source-trusted default; it
+    honors explicit global opt-outs without enabling arbitrary directories.
+    An unknown spelling is an error rather than a silent bypass of those gates.
     """
 
     IN_TREE = "in-tree"
     EXTERNAL = "external"
     INSTALLED = "installed"
+    DEFAULT_MANAGED = "default-managed"
 
 
 def policy_source(kind: str) -> PluginSource:
@@ -202,6 +204,10 @@ def plugin_state(
         enabled, origin = integrations[name], "integrations (legacy)"
     elif selected:
         enabled, origin = True, "distribution"
+    elif source is PluginSource.DEFAULT_MANAGED and (
+        not legacy or feature_source(legacy, config=config, env=env, channel=channel) in {"channel", "unset"}
+    ):
+        enabled, origin = True, "default plugin"
     elif legacy:
         enabled = _raw_feature_enabled(legacy, config=config, env=env, channel=channel)
         origin = "legacy feature: " + feature_source(legacy, config=config, env=env, channel=channel)
@@ -216,6 +222,12 @@ def plugin_state(
         enabled, reason = False, "external plugin loading disabled"
     if source is PluginSource.INSTALLED and env.get("SPARKRUN_NO_INSTALLED_PLUGINS", "").lower() in {"1", "true", "yes"}:
         enabled, reason = False, "installed plugin loading disabled"
+    if source is PluginSource.DEFAULT_MANAGED:
+        # The release's scoped trust permits only this managed payload. An
+        # explicit global opt-out still wins; never activate plugins.paths.
+        explicit_gate = feature_source("core.external_plugins", config=config, env=env) not in {"channel", "unset"}
+        if _external_plugins_disabled() or (explicit_gate and not _raw_feature_enabled("core.external_plugins", config=config, env=env)):
+            enabled, reason = False, "external plugin loading disabled"
     return PluginState(enabled, origin, reason, required)
 
 

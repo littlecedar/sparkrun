@@ -48,11 +48,15 @@ Because this bind-mounts a host directory into the container, it is honored only
 default-registry, or `--trust`); an untrusted registry/URL recipe with an absolute-path model fails closed. This is the
 ergonomic front-end for the lower-level `cluster_config.resolved_model_path` escape hatch.
 
-Since distribution is skipped, the path must genuinely already exist on **every target node** — the control machine
-need not be a cluster member and need not see the path itself. Before launch, sparkrun verifies the path on the targets
-via the executor (host substrate → SSH `test -e`; provider executors probe their own volumes) and fails fast listing any
-node where it's missing, rather than letting the container crash. This preflight is best-effort: an unreachable or
-unverifiable node never blocks the launch.
+Since distribution is skipped, the path must already exist on **every target node**; the control machine need not
+see it. Before launch, native vLLM, SGLang, Atlas and MAX launches check HF directories for readable, valid
+`config.json`, weight files and shards named by weight indexes. Local GGUF files are checked separately, including
+the other files of a split GGUF. Other runtime directory formats do not require HF-specific files.
+Failures identify the host and path. Docker and local executors also check access through the workload's mounts
+and execution user before replacing an existing workload; custom executors can provide `model_access_command`.
+These checks read metadata and open weights without reading their payloads. A directory without a trusted manifest
+remains **unverified**: basic usability checks do not establish checksum integrity, an HF revision, or identical
+contents across nodes. No manifest is created and local weights are not downloaded, copied, or repaired.
 
 `model_revision` affects download, cache checking, VRAM auto-detection, and model sync. Pin to a commit hash for
 reproducible deployments.
@@ -272,7 +276,7 @@ environment. `{launch.NAME}` accepts these fields:
 | Field | Meaning |
 |---|---|
 | `model_path` | Prepared model directory or selected GGUF file, mapped into the workload's mounts. Local execution uses its host path. |
-| `model_revision` | Concrete Hugging Face snapshot commit shared by the selected nodes. Unavailable for arbitrary local model paths. |
+| `model_revision` | Known revision from the prepared model, including an imported manifest. Empty string for a resolved local model without a known revision. |
 | `runtime_cache_dir` | This launch's persistent compilation-cache mount, also exposed to in-container hooks as `SPARKRUN_RUNTIME_CACHE_DIR`. Local execution uses the host directory. |
 | `num_nodes` | Number of selected, distinct physical hosts. |
 | `node_rank` | Zero-based position in that host order; a node ordinal, not a GPU/process rank. |
@@ -305,7 +309,11 @@ Model fields trigger read-only checks of the prepared cache on each target host.
 A pinned commit needs no `refs/main`; a branch/tag must have its cached ref.
 All nodes must contain the same selected commit and indexed weight files must
 exist. There is no arbitrary snapshot fallback or download during resolution.
-For local paths, the path must exist. Requesting its HF `model_revision` fails.
+For local paths, the path must exist. A resolved local model without a known revision renders
+`{launch.model_revision}` as an empty string, even if the recipe retains an HF pin. For example,
+`engram/{launch.model_revision}` becomes `engram/`; recipes that require revision-specific caches must account
+for this. A revision supplied by a validated manifest is preserved. Missing launch facts and failed model
+resolution still raise errors, as do empty required paths such as `launch.model_path`.
 A GGUF selector must identify one file or a complete shard set. These checks
 establish path availability, not model correctness or weight-content hashes.
 

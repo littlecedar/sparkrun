@@ -19,3 +19,10 @@ def enable(name, *, config=None, dry_run=False, sctx=None):
 def disable(name, *, config=None, dry_run=False, sctx=None):
     """Disable loading, retaining settings and allowing broken-plugin recovery."""
     return change_plugin(_config(config, sctx), name, False, dry_run=dry_run)
+
+
+def sync_defaults(*, config=None, dry_run=False, sctx=None):
+    """Install missing trusted defaults; dry runs use local metadata only."""
+    from sparkrun.core.plugin_defaults import reconcile_default_plugins
+
+    return reconcile_default_plugins(_config(config, sctx), dry_run=dry_run)

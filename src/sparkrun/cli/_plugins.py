@@ -71,6 +71,10 @@ def _show_result(result):
     )
     for message in result.get("messages", []):
         click.echo(message)
+    if result.get("reason"):
+        click.echo("  " + result["reason"])
+    if result.get("error"):
+        click.echo("  " + result["error"], err=True)
     if result.get("restart_required"):
         click.echo("Restart long-running plugin consumers to apply this change.")
     if result.get("warning"):
@@ -88,6 +92,7 @@ def plugins(ctx):
     disabled ones). Listing covers bundled plugins, directory plugins,
     installed integrations, and managed external plugins.
     Add, update, rollback, and remove manage plugins installed with this group.
+    Sync installs missing application defaults; --dry-run previews the catalog.
 
     Managed installations are stored beside the active configuration, separately
     from the Python environment, and survive {app_command} upgrades. The
@@ -113,6 +118,7 @@ def plugins_enable(ctx, name, dry_run):
 
     Works for bundled, installed, directory and managed plugins. Enabling a
     gateway plugin does not select it; explicitly enable its gateway feature.
+    For a missing default, clears its removal opt-out; run plugins sync to install.
     """
     from sparkrun.core.plugin_lifecycle import change_plugin
 
@@ -130,6 +136,7 @@ def plugins_disable(ctx, name, dry_run):
     A disabled plugin contributes no commands, operations or feature definitions
     to new processes. Existing services are not stopped. This command remains
     usable when the plugin is broken; optional cleanup hook failures are reported.
+    Also prevents installation of a declared default that is not installed yet.
     """
     from sparkrun.core.plugin_lifecycle import change_plugin
 
@@ -231,6 +238,7 @@ def plugins_list(ctx, output_json, include_all, check):
                     PluginMetadata.from_dict(plugin.management["metadata"]),
                     plugin.path / "payload" / Path(*module_parts(plugin.module)),
                     config.config_path,
+                    default_managed=plugin.source == "default-managed",
                 )
                 row["load_check"] = "passed"
             except PluginError as exc:
@@ -319,6 +327,31 @@ def _declares_gateway(plugin, gateway: str, plugin_details) -> bool:
     return "gateway." + gateway in details["declarations"].get("features", {})
 
 
+@plugins.command("sync", short_help="Install missing default plugins.")
+@click.option("--dry-run", is_flag=True, help="Preview defaults using local metadata only; no network or installation")
+@json_option()
+@click.pass_context
+@plugin_errors
+def plugins_sync(ctx, dry_run, output_json):
+    """Install the application's trusted defaults unless disabled or removed.
+
+    Existing providers, sources, and pins are preserved. Use plugins update to
+    update installed plugins. This command is also available as setup plugins sync.
+    """
+    from sparkrun.core.plugin_defaults import reconcile_default_plugins
+
+    rows = reconcile_default_plugins(management_config(ctx), dry_run=dry_run)
+    if output_json:
+        print_json(rows)
+    else:
+        for row in rows:
+            _show_result(row)
+        if not rows:
+            click.echo("No default plugins declared by this application.")
+    if any(row["status"] == "failed" for row in rows):
+        ctx.exit(1)
+
+
 @plugins.command("add", short_help="Install a plugin from a Git repository.")
 @click.argument("source", metavar="SOURCE")
 @click.option("--ref", metavar="REF", default="main", show_default=True, help="Git branch, tag, or full commit ID to install")
@@ -394,6 +427,7 @@ def plugins_update(ctx, selector, update_all, ref, trust, dry_run):
     Each replacement must pass compatibility and loading checks. Failed updates
     leave the active plugin intact, and --all continues with the other plugins.
     Previous source trust is reused; changed declarations require new consent.
+    --all also installs missing trusted application defaults, honoring opt-outs.
 
     Core updates also update managed plugins by default. To audit only, use:
 
@@ -409,12 +443,25 @@ def plugins_update(ctx, selector, update_all, ref, trust, dry_run):
     if bool(selector) == update_all or (update_all and (ref or trust)):
         raise click.UsageError("Choose one plugin or --all; --ref/--trust require a single plugin")
     manager = _manager(ctx)
+    failures = []
+    installed = set()
     if update_all and not dry_run:
         with manager.store.mutation():
             pass
+    if update_all:
+        from sparkrun.core.plugin_defaults import reconcile_default_plugins
+
+        for row in reconcile_default_plugins(manager.config, dry_run=dry_run, manager=manager):
+            if row["status"] != "present":
+                _show_result(row)
+            if row["status"] == "installed":
+                installed.add(row["name"])
+            if row["status"] == "failed":
+                failures.append(row["name"])
     selectors = [selector] if selector else sorted(manager.store.snapshot()[1])
-    failures = []
     for name in selectors:
+        if name in installed:
+            continue
         try:
             _show_result(manager.update(name, ref=ref, trust=trust, dry_run=dry_run, consent=_trust))
         except PluginError as exc:

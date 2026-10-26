@@ -141,10 +141,11 @@ not enable feature flags or install plugins.
 sparkrun model-cache list --cluster <cluster_name>
 sparkrun model-cache inspect org/model-name --hosts <host1>,<host2>
 sparkrun model-cache repair org/model-name --cluster <cluster_name> --dry-run
-sparkrun model-cache prune --cluster <cluster_name> --max-bytes 107374182400 --dry-run
-sparkrun model-cache pin org/model-name --revision <commit_id> --cluster <cluster_name>
+sparkrun model-cache prune --cluster <cluster_name> --max-bytes 100G     # preview; --apply to remove
+sparkrun model-cache pin org/model-name --revision <commit_or_ref> --cluster <cluster_name>
 sparkrun model-cache delete org/model-name --cluster <cluster_name> --dry-run
 sparkrun model-cache adopt org/model-name --cluster <cluster_name>   # preview; --apply to track
+sparkrun model-cache reconcile org/model-name --cluster <cluster_name>  # preview; --apply to release
 ```
 
 Targets resolve like other commands: `--cluster`/`--hosts`/`--hosts-file`, else the
@@ -155,7 +156,10 @@ among eligible managed revisions, respects pins/live claims, leaves untracked sn
 alone, and removes only blobs no other revision uses. Usage records cover Sparkrun lifecycle activity,
 not every external read. To remove a specific model regardless of pins, use
 `model-cache delete` (preview first; it needs explicit confirmation or `--yes`,
-and `--force` for revisions a workload claims). Do not replace either with
+and `--force` for revisions a workload claims). A claim whose workload is gone
+(nothing in `sparkrun status`) is released by `model-cache reconcile <model>` or
+`--all`; it previews by default and keeps claims it cannot prove orphaned (unreachable
+hosts, younger than an hour). Prefer it to `--force`. Do not replace either with
 recursive cache deletion. Revisions downloaded outside sparkrun are untracked until
 `model-cache adopt` (preview by default; name a model or pass `--all`): each file is
 checked against the model origin, or with `--offline` only Hub-layout snapshots qualify;

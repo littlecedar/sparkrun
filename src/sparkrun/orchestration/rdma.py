@@ -331,6 +331,7 @@ def build_nccl_test_cmd(
     env: dict[str, str] | None = None,
     ranks_per_node: int = 1,
     nccl_tests_dir: str = "/opt/nccl-tests/build",
+    tcp_if_include: str | None = None,
 ) -> str:
     """Build the ``mpirun`` command for an nccl-tests collective.
 
@@ -349,6 +350,12 @@ def build_nccl_test_cmd(
         env: Variables to forward with ``-x``.
         ranks_per_node: One per accelerator. 1 on DGX Spark.
         nccl_tests_dir: Directory holding the built binaries in the image.
+        tcp_if_include: Open MPI ``oob_tcp_if_include`` / ``btl_tcp_if_include``
+            value (an interface name or CIDR). Unpinned, Open MPI advertises
+            every local address, including docker bridge networks
+            (``br-*``, 172.x) that peers cannot route to; ``MPI_Init`` then
+            blocks on the unreachable address until the outer timeout, with
+            no output at all. ``None`` omits both.
 
     Returns:
         The command string.
@@ -365,6 +372,9 @@ def build_nccl_test_cmd(
         "-H",
         ",".join("%s:%d" % (a, ranks_per_node) for a in addresses),
     ]
+    if tcp_if_include:
+        value = quote(tcp_if_include)
+        parts.extend(["--mca", "oob_tcp_if_include", value, "--mca", "btl_tcp_if_include", value])
     for key in sorted(env or {}):
         parts.extend(["-x", key])
     parts.extend(

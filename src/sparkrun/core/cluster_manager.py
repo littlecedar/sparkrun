@@ -92,6 +92,7 @@ _MODEL_OPTION_FIELDS = (
     "idle_timeout_s",
     "timeout_s",
     "stall_retries",
+    "lease_timeout_s",
 )
 
 
@@ -135,6 +136,7 @@ class ResourceDistributionPrefs:
     idle_timeout_s: float | None = None
     timeout_s: float | None = None
     stall_retries: int | None = None
+    lease_timeout_s: float | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ResourceDistributionPrefs":
@@ -153,6 +155,7 @@ class ResourceDistributionPrefs:
             idle_timeout_s=data.get("idle_timeout_s"),
             timeout_s=data.get("timeout_s"),
             stall_retries=data.get("stall_retries"),
+            lease_timeout_s=data.get("lease_timeout_s"),
         )
 
     def is_default(self) -> bool:

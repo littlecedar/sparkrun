@@ -7,12 +7,13 @@ firing over SSH before the wizard had asked who to connect as.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest import mock
 
 import pytest
 from click.testing import CliRunner
 
-from sparkrun.api.setup import SshProbe
+from sparkrun.api.setup import LocalSshKey, SshProbe
 from sparkrun.cli import main
 from sparkrun.cli._setup._ssh import _default_ssh_user, _ensure_ssh_access
 from sparkrun.core.cluster_manager import ClusterManager
@@ -131,6 +132,39 @@ def test_gate_does_not_offer_bootstrap_for_changed_host_key(capsys):
     install.assert_not_called()
     assert outcome.blocked == ["h1"]
     assert "ssh-keygen -R h1" in capsys.readouterr().err
+
+
+def test_gate_verifies_with_the_key_it_just_generated():
+    """A fresh controller has no ``ssh.key``, so the gate generates one and installs it.
+
+    The re-probe must offer that key. It used the key read from config before the
+    key existed (``None``), so every host stayed "Still failing" and the wizard
+    skipped every later setup step as unreachable.
+    """
+    key = LocalSshKey(
+        path=Path("/cfg/ssh/sparkrun_ed25519"),
+        public_path=Path("/cfg/ssh/sparkrun_ed25519.pub"),
+        public_key="ssh-ed25519 AAAA sparkrun@test",
+        generated=True,
+    )
+    config = mock.Mock(ssh_key=None, ssh_options=[], config_path="/cfg/config.yaml")
+
+    def probe(hosts, user, *, key=None, options=None):
+        accepted = key == "/cfg/ssh/sparkrun_ed25519"
+        return _probes(**{h: {"ok": accepted, "auth_failed": not accepted} for h in hosts})
+
+    with (
+        mock.patch("sparkrun.api.setup.probe_ssh_access", side_effect=probe),
+        mock.patch("sparkrun.api.setup.ensure_local_key", return_value=key),
+        mock.patch("sparkrun.api.setup.install_public_key_interactive") as install,
+        # "Try a different SSH username first?" -> no; "Set up key-based SSH access?" -> yes
+        mock.patch("click.confirm", side_effect=[False, True]),
+    ):
+        outcome = _ensure_ssh_access(["h1"], "ubuntu", config)
+
+    install.assert_called_once()
+    assert outcome.ok_hosts == ["h1"]
+    assert not outcome.blocked
 
 
 def test_gate_does_not_offer_bootstrap_for_unreachable_hosts(capsys):

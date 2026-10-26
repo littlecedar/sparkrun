@@ -14,7 +14,9 @@ from sparkrun.core.plugin_manifest import PluginError, PluginMetadata
 PROTOCOL_VERSION = 1
 
 
-def validate_candidate(metadata: PluginMetadata, package: Path, config_path: Path, *, timeout: int = 60) -> None:
+def validate_candidate(
+    metadata: PluginMetadata, package: Path, config_path: Path, *, timeout: int = 60, default_managed: bool = False
+) -> None:
     from sparkrun.core.application_profile import child_environment
 
     with tempfile.TemporaryDirectory(prefix="sparkrun-plugin-check-") as temporary:
@@ -27,10 +29,12 @@ def validate_candidate(metadata: PluginMetadata, package: Path, config_path: Pat
                     "metadata": metadata.to_dict(),
                     "package": str(package.resolve()),
                     "result": str(result_path),
+                    "default_managed": default_managed,
                 }
             )
         )
         env = {**os.environ, **child_environment(config_path=config_path), "PYTHONDONTWRITEBYTECODE": "1", "SPARKRUN_NO_TELEMETRY": "1"}
+        env["SPARKRUN_NO_DEFAULT_PLUGINS"] = "1"
         try:
             result = subprocess.run(
                 [sys.executable, "-m", __name__, str(request)], env=env, capture_output=True, text=True, timeout=timeout
@@ -68,7 +72,10 @@ def main():
 
     if metadata.feature:
         os.environ[env_name("FEATURE_" + metadata.feature.upper().replace(".", "_").replace("-", "_"))] = "1"
-    managed._validation_candidate = ({"metadata": metadata.to_dict()}, Path(request["package"]))
+    record = {"metadata": metadata.to_dict()}
+    if request.get("default_managed") is True:
+        record["trust"] = {"granted": True, "default_managed": True}
+    managed._validation_candidate = (record, Path(request["package"]))
     init_sparkrun(config=config)
     if loaded_plugin_module(metadata.module) is None:
         raise PluginError("Candidate did not register successfully")

@@ -35,6 +35,19 @@ logger = logging.getLogger(__name__)
 
 EXT_EXECUTOR = "sparkrun.executor"
 
+#: Executor name -> ``(feature flag, status_scope)`` for executors registered
+#: while their flag resolved off.  A gated executor hides itself from
+#: ``get_extensions``, so status cannot query it and its workloads look absent;
+#: registration is the one point where both are visible (the
+#: ``bootstrap._BUILDER_GATES`` precedent).  Read via :func:`gated_off_executors`.
+_GATED_OFF_EXECUTORS: dict[str, tuple[str, str]] = {}
+
+
+def gated_off_executors() -> dict[str, tuple[str, str]]:
+    """Registered executors hidden by their feature flag: name -> ``(flag, status_scope)``."""
+    return dict(_GATED_OFF_EXECUTORS)
+
+
 # Canonical container/pod label schema for sparkrun-launched workloads.
 # Concrete executors emit these in their native annotation system
 # (Docker --label, k8s metadata.labels, etc.) and query_status reads
@@ -422,6 +435,14 @@ class Executor(Plugin):
 
             return feature_gate_enabled(self.required_feature_flag, v)
         return True
+
+    def on_registration(self, v: Variables) -> None:
+        if not self.executor_name:
+            return
+        if self.required_feature_flag and not self.is_multi_extension(v):
+            _GATED_OFF_EXECUTORS[self.executor_name] = (self.required_feature_flag, self.status_scope)
+        else:
+            _GATED_OFF_EXECUTORS.pop(self.executor_name, None)
 
     def initialize(self, v: Variables, logger=None) -> "Executor":
         return self

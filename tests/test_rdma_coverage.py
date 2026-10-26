@@ -382,6 +382,7 @@ def test_nccl_nonzero_exit_cannot_pass_with_a_printed_bandwidth():
     with (
         mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[RemoteResult(h, 0, "", "") for h in dets]),
         mock.patch("sparkrun.api.setup._rdma._run_commands", return_value={0: (REAL_NCCL_OUTPUT, 1)}),
+        mock.patch("sparkrun.orchestration.primitives.try_clear_page_cache"),
     ):
         result = _run_nccl(
             list(dets), derive_link_pairs(dets, list(dets)), _facts(dets), dets, {}, msg_size="16G", binary="all_gather_perf", timeout=60
@@ -501,3 +502,204 @@ def test_default_nccl_suite_uses_all_hosts_without_sampling_guidance(caplog):
     assert len(nccl.call_args.args[1]) == 6
     rounds.assert_not_called()
     assert not any("quick sample" in msg or "Use --full" in msg for msg in caplog.messages)
+
+
+# ---------------------------------------------------------------------------
+# NCCL collective: MPI pinning, memory, diagnosis and progress
+# ---------------------------------------------------------------------------
+
+
+def _mgmt(host, ip, subnets, iface="enP7s7"):
+    det = _det(host, [], mgmt_iface=iface)
+    det.mgmt_ip = ip
+    det.used_subnets = set(subnets)
+    return det
+
+
+def test_mpi_pin_prefers_the_shared_management_subnet_over_docker_bridges():
+    from sparkrun.api.setup._rdma import _mpi_tcp_if_include
+
+    # The control node carries docker bridge networks; peers cannot route to
+    # them, which is what left MPI_Init blocked until the timeout.
+    dets = {
+        "a": _mgmt("a", "10.24.11.11", {"10.24.11.0/24", "172.18.0.0/16", "172.19.0.0/16", "10.0.0.0/8"}),
+        "b": _mgmt("b", "10.24.11.13", {"10.24.11.0/24"}),
+    }
+    assert _mpi_tcp_if_include(["a", "b"], dets) == "10.24.11.0/24"
+
+
+def test_mpi_pin_falls_back_to_a_shared_interface_name_then_to_none():
+    from sparkrun.api.setup._rdma import _mpi_tcp_if_include
+
+    routed = {"a": _mgmt("a", "10.1.0.5", {"10.1.0.0/24"}), "b": _mgmt("b", "10.2.0.5", {"10.2.0.0/24"})}
+    assert _mpi_tcp_if_include(["a", "b"], routed) == "enP7s7"
+
+    # Different subnets and different names: a list would make Open MPI warn
+    # (CIDR) or abort (name) on the hosts lacking an entry, so stay unpinned.
+    mixed = {"a": _mgmt("a", "10.1.0.5", {"10.1.0.0/24"}, "eth0"), "b": _mgmt("b", "10.2.0.5", {"10.2.0.0/24"}, "eno1")}
+    assert _mpi_tcp_if_include(["a", "b"], mixed) is None
+    assert _mpi_tcp_if_include(["a", "b"], {}) is None
+
+
+def test_nccl_command_pins_both_open_mpi_tcp_channels():
+    from sparkrun.orchestration.rdma import build_nccl_test_cmd
+
+    cmd = build_nccl_test_cmd(["h1", "h2"], rsh_agent="/tmp/agent", tcp_if_include="10.24.11.0/24")
+    assert "--mca oob_tcp_if_include 10.24.11.0/24" in cmd
+    assert "--mca btl_tcp_if_include 10.24.11.0/24" in cmd
+    # Options precede the binary, or mpirun hands them to all_gather_perf.
+    assert cmd.index("btl_tcp_if_include") < cmd.index("all_gather_perf")
+    assert "if_include" not in build_nccl_test_cmd(["h1", "h2"], rsh_agent="/tmp/agent")
+
+
+def _nccl_run(dets, output, rc):
+    from sparkrun.api.setup._rdma import _run_nccl
+    from sparkrun.orchestration.ssh import RemoteResult
+
+    with (
+        mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel", return_value=[RemoteResult(h, 0, "", "") for h in dets]),
+        mock.patch("sparkrun.api.setup._rdma._run_commands", return_value={0: (output, rc)}) as commands,
+        mock.patch("sparkrun.orchestration.primitives.try_clear_page_cache") as clear,
+    ):
+        result = _run_nccl(
+            list(dets), derive_link_pairs(dets, list(dets)), _facts(dets), dets, {}, msg_size="16G", binary="all_gather_perf", timeout=600
+        )
+    return result, commands, clear
+
+
+def test_nccl_drops_page_cache_and_pins_mpi_before_the_collective():
+    from test_rdma import REAL_NCCL_OUTPUT
+
+    dets = _switch(("h1", "h2"))
+    for i, det in enumerate(dets.values()):
+        det.mgmt_ip = "10.24.11.%d" % (i + 1)
+        det.used_subnets = {"10.24.11.0/24"}
+    result, commands, clear = _nccl_run(dets, REAL_NCCL_OUTPUT, 0)
+    assert result.status == "ok"
+    clear.assert_called_once()
+    assert sorted(clear.call_args.args[0]) == ["h1", "h2"]
+    sent = commands.call_args.args[1][0]
+    assert "btl_tcp_if_include 10.24.11.0/24" in sent
+    assert "HWLOC_COMPONENTS=-gl" in sent
+
+
+@pytest.mark.parametrize(
+    "output,rc,expected",
+    [
+        ("", 124, "timed out after 600s"),
+        ("spark-2918: Test CUDA failure common.cu:1569 'out of memory'\n", 2, "ran out of GPU memory"),
+        ("mpirun noticed something\n", 1, "collective failed (rc=1)"),
+    ],
+)
+def test_nccl_failure_detail_names_the_cause(output, rc, expected):
+    result, _, _ = _nccl_run(_switch(("h1", "h2")), output, rc)
+    assert result.status == STATUS_FAIL
+    assert expected in result.detail
+
+
+def test_heartbeat_reports_elapsed_time_until_the_step_returns(caplog):
+    import threading
+
+    from sparkrun.api.setup._rdma import _with_heartbeat
+
+    caplog.set_level(25, logger="sparkrun.progress")
+    release = threading.Event()
+
+    def slow():
+        release.wait(5)
+        return "done"
+
+    timer = threading.Timer(0.35, release.set)
+    timer.start()
+    try:
+        assert _with_heartbeat("NCCL all_gather_perf", slow, budget_s=600, interval_s=0.1) == "done"
+    finally:
+        timer.cancel()
+    beats = [m for m in caplog.messages if "still running" in m]
+    assert beats, caplog.messages
+    assert all("NCCL all_gather_perf" in m and "gives up at 600s" in m for m in beats)
+
+
+def test_heartbeat_propagates_the_step_exception():
+    from sparkrun.api.setup._rdma import _with_heartbeat
+
+    def boom():
+        raise RdmaTestError("nope")
+
+    with pytest.raises(RdmaTestError, match="nope"):
+        _with_heartbeat("x", boom, interval_s=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Test image distribution goes through the launch's distribution
+# ---------------------------------------------------------------------------
+
+
+class _Config:
+    """Just enough SparkrunConfig for distribution scoping."""
+
+    def __init__(self, ssh_user="configuser"):
+        self.ssh_user = ssh_user
+        self.ssh_key = None
+        self.ssh_options = []
+        self.hf_cache_dir = "/cache/hf"
+
+    def for_cluster(self, cluster):
+        if cluster is not None and cluster.user:
+            from copy import copy
+
+            scoped = copy(self)
+            scoped.ssh_user = cluster.user
+            return scoped
+        return self
+
+
+def _prepare(cluster, ssh_kwargs, *, offline=False, side_effect=None):
+    from sparkrun.api.setup._rdma import _prepare_container
+
+    with (
+        mock.patch("sparkrun.orchestration.distribution.distribute_resources", side_effect=side_effect) as dist,
+        mock.patch("sparkrun.api.setup._rdma._start_containers", return_value=([], {})),
+    ):
+        _prepare_container(
+            ["h1", "h2"], "img:1", ssh_kwargs, need_gpu=True, mount_ssh=True, config=_Config(), cluster=cluster, offline=offline
+        )
+    return dist
+
+
+def test_image_uses_the_clusters_transfer_mode_and_connection():
+    cluster = ClusterDefinition(name="c", hosts=["h1", "h2"], user="clusteruser", transfer_mode="delegated", topology="switch")
+    dist = _prepare(cluster, {"ssh_user": "clusteruser"}, offline=True)
+    args, kwargs = dist.call_args
+    assert args[0] == "img:1" and args[1] == "" and args[2] == ["h1", "h2"]
+    assert args[4].ssh_user == "clusteruser"
+    assert kwargs["transfer_mode"] == "delegated"
+    assert kwargs["topology"] == "switch"
+    assert kwargs["offline"] is True
+
+
+def test_image_distribution_connects_as_an_explicit_user_override():
+    cluster = ClusterDefinition(name="c", hosts=["h1", "h2"], user="clusteruser")
+    dist = _prepare(cluster, {"ssh_user": "override"})
+    assert dist.call_args.args[4].ssh_user == "override"
+    assert dist.call_args.kwargs["transfer_mode"] == "auto"
+
+
+def test_image_distribution_failure_is_an_rdma_test_error():
+    from sparkrun.orchestration.distribution import DistributionError
+
+    with pytest.raises(RdmaTestError, match="Could not distribute img:1.*h2"):
+        _prepare(None, {"ssh_user": "configuser"}, side_effect=DistributionError("Image distribution failed on: h2"))
+
+
+def test_offline_comes_from_the_cluster_unless_the_caller_chooses():
+    cluster = ClusterDefinition(name="c", hosts=["h1", "h2"], offline=True)
+    with (
+        mock.patch("sparkrun.api.setup._rdma._run_probe", return_value=_facts(_switch(("h1", "h2")))),
+        mock.patch("sparkrun.orchestration.networking.detect_cx7_for_hosts", return_value=_switch(("h1", "h2"))),
+        mock.patch("sparkrun.api.setup._rdma._prepare_container", side_effect=RdmaTestError("stop here")) as prep,
+    ):
+        for offline, expected in ((None, True), (False, False)):
+            with pytest.raises(RdmaTestError, match="stop here"):
+                rdma_test(_Sctx(), ["h1", "h2"], {}, suite="perftest", force_container=True, cluster=cluster, offline=offline)
+            assert prep.call_args.kwargs["offline"] is expected

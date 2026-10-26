@@ -178,7 +178,9 @@ class PluggableGroup(click.Group):
     def _main_shell_completion(self, *args, **kwargs):
         # Click owns the completion flag and enters this hook before building
         # contexts. Avoid loading an application profile merely to detect TAB.
-        with _completion_diagnostics():
+        from sparkrun.core.plugin_defaults import suspend_default_installation
+
+        with _completion_diagnostics(), suspend_default_installation():
             return super()._main_shell_completion(*args, **kwargs)
 
     def _ensure_cli_extensions_loaded(self, ctx: click.Context) -> None:

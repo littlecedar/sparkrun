@@ -339,7 +339,12 @@ def _forget_job(cluster_id: str, cache_dir: str | None, *, hosts=None, ssh_kwarg
     from sparkrun.orchestration.workload_cleanup import finalize_workload
 
     try:
-        finalize_workload(cluster_id, hosts=hosts or (), cache_dir=cache_dir, ssh_kwargs=ssh_kwargs)
+        if not finalize_workload(cluster_id, hosts=hosts or (), cache_dir=cache_dir, ssh_kwargs=ssh_kwargs):
+            logger.warning(
+                "Kept job metadata for %s: model cache claims remain on hosts this stop did not confirm; "
+                "stop it by id or run model-cache reconcile --all",
+                cluster_id,
+            )
     except Exception:
         logger.warning(
             "Could not release model cache claims or remove job metadata for %s; retry stop to reconcile", cluster_id, exc_info=True

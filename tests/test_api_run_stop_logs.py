@@ -329,6 +329,82 @@ def test_discover_cluster_id_sweeps_whole_host_scope(monkeypatch):
     assert found == cid  # discovered via the local sweep, not docker
 
 
+def test_discover_cluster_id_passes_the_cluster_hardware_inventory(monkeypatch):
+    """Intent discovery queries status with the cluster's saved inventory, the
+    way ``api.status`` does, so the executors never fall back to
+    ``resolve_hardware()`` for a host the cluster already describes."""
+    from sparkrun.api._resolve import discover_cluster_id_by_intent
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.cluster_status import HostOccupancy, RunningWorkload
+    from sparkrun.core.hardware import AcceleratorSpec, HostHardware
+
+    intent = "aabbccddeeff0011"
+    cid = "sparkrun_%s_0123456789ab" % intent
+    hw = HostHardware([AcceleratorSpec("nvidia", "jetson-orin", memory_gb=61.3)], source="detected")
+    queries: list[dict] = []
+
+    def _query(*args, **kwargs):
+        queries.append(kwargs)
+        return ClusterStatus(hosts=(HostOccupancy(host="h1", workloads=(RunningWorkload(cluster_id=cid),)),), executor="docker")
+
+    monkeypatch.setattr("sparkrun.orchestration.executor.query_status_for_cluster", _query)
+
+    found = discover_cluster_id_by_intent(
+        intent,
+        ["h1"],
+        cluster_def=ClusterDefinition(name="c", hosts=["h1"], hosts_hardware={"h1": hw}),
+        cache_dir=None,
+        sctx=None,
+    )
+
+    assert found == cid
+    assert queries[0]["host_hardware"] == {"h1": hw}
+
+
+def test_discover_cluster_id_under_require_metadata_profile(monkeypatch):
+    """End to end through the real docker/local executors: an application
+    profile with ``hardware_fallback="require-metadata"`` finds its running
+    workload on a cluster whose inventory was probed, instead of reporting
+    the host's status as unavailable."""
+    import json
+
+    from sparkrun.api._resolve import discover_cluster_id_by_intent
+    from sparkrun.core.application_profile import ApplicationProfile, select_application_profile
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.hardware import AcceleratorSpec, HostHardware
+
+    profile = select_application_profile(
+        ApplicationProfile(
+            id="jetsonrun",
+            display_name="Jetsonrun",
+            command="jetsonrun",
+            package="jetsonrun",
+            hardware_fallback="require-metadata",
+        )
+    )
+    intent = "aabbccddeeff0011"
+    cid = "jetsonrun_%s_0123456789ab" % intent
+    hw = HostHardware([AcceleratorSpec("nvidia", "jetson-orin", memory_gb=61.3)], source="detected")
+
+    def _fake_parallel(hosts, script, **kwargs):
+        out = ""
+        if script.startswith("docker ps"):
+            out = json.dumps({"ID": "x", "Names": cid + "_solo", "Labels": "sparkrun.distribution=" + profile.id}) + "\n"
+        return [RemoteResult(h, 0, out, "") for h in hosts]
+
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", _fake_parallel)
+
+    found = discover_cluster_id_by_intent(
+        intent,
+        ["localhost"],
+        cluster_def=ClusterDefinition(name="c", hosts=["localhost"], hosts_hardware={"localhost": hw}),
+        cache_dir=None,
+        sctx=None,
+    )
+
+    assert found == cid
+
+
 # --------------------------------------------------------------------------
 # api.logs — argument validation
 # --------------------------------------------------------------------------
@@ -513,7 +589,9 @@ def test_log_inspection_preserves_pending_launch_claims(tmp_path, relaunch, filt
         with pytest.raises(api.JobNotFound, match="job metadata has been preserved"):
             api.logs(cluster_id, hosts=("h1",), cache_dir=str(tmp_path), **({"host": "h1"} if filtered else {}))
         release.assert_not_called()
-    assert load_job_metadata(cluster_id, cache_dir=str(tmp_path))["model_cache_claims"] == claims
+    # A relaunch under the same ID keeps the earlier launch's claim alongside its own.
+    expected = [{**claims[0], "claim": "pending-launch"}] + (claims if relaunch else [])
+    assert load_job_metadata(cluster_id, cache_dir=str(tmp_path))["model_cache_claims"] == expected
 
 
 def test_logs_precheck_worker_alive_when_head_dead(tmp_path):
@@ -606,6 +684,66 @@ def test_filtered_logs_precheck_only_selected_worker(tmp_path, selected_alive):
                 api.open_log_target(cid, host="h2", cache_dir=str(tmp_path))
         assert query.call_args.args[0] == ["h2"]
     assert load_job_metadata(cid, cache_dir=str(tmp_path)) is not None
+
+
+def test_logs_precheck_passes_the_cluster_hardware_inventory(tmp_path):
+    """The liveness precheck queries status with the cluster's saved
+    inventory, as ``api.status`` does."""
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.hardware import AcceleratorSpec, HostHardware
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata
+
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "sglang", "model": "test/m"})
+    cid = "sparkrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cid, recipe, ["h1"], cache_dir=str(tmp_path))
+    hw = HostHardware([AcceleratorSpec("nvidia", "jetson-orin", memory_gb=61.3)], source="detected")
+    cluster = ClusterDefinition(name="c", hosts=["h1"], hosts_hardware={"h1": hw})
+    snapshot = _make_status({"h1": [(cid, [cid + "_solo"])]})
+
+    with patch.object(DockerExecutor, "query_status", return_value=snapshot) as query:
+        api.open_log_target(cid, cluster=cluster, cache_dir=str(tmp_path))
+
+    assert query.call_args.kwargs["host_hardware"] == {"h1": hw}
+
+
+def test_logs_precheck_runs_under_require_metadata_profile(tmp_path, monkeypatch):
+    """End to end through the real docker executor: under a
+    ``require-metadata`` profile the precheck still reports a dead workload
+    on a cluster whose inventory was probed, instead of the status query
+    raising and the check being skipped silently."""
+    from sparkrun.core.application_profile import ApplicationProfile, select_application_profile
+    from sparkrun.core.cluster_manager import ClusterDefinition
+    from sparkrun.core.hardware import AcceleratorSpec, HostHardware
+    from sparkrun.core.recipe import Recipe
+    from sparkrun.orchestration.job_metadata import save_job_metadata
+
+    select_application_profile(
+        ApplicationProfile(
+            id="jetsonrun",
+            display_name="Jetsonrun",
+            command="jetsonrun",
+            package="jetsonrun",
+            hardware_fallback="require-metadata",
+        )
+    )
+    recipe = Recipe({"sparkrun_version": "2", "runtime": "sglang", "model": "test/m"})
+    cid = "jetsonrun_aaaaaaaaaaaaaaaa_111111111111"
+    save_job_metadata(cid, recipe, ["h1"], cache_dir=str(tmp_path))
+    hw = HostHardware([AcceleratorSpec("nvidia", "jetson-orin", memory_gb=61.3)], source="detected")
+    cluster = ClusterDefinition(name="c", hosts=["h1"], hosts_hardware={"h1": hw})
+
+    # Host reachable, nothing running.
+    monkeypatch.setattr(
+        "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
+        lambda hosts, script, **kw: [RemoteResult(h, 0, "", "") for h in hosts],
+    )
+
+    with (
+        patch.object(DockerExecutor, "describe_terminated", return_value={}),
+        pytest.raises(api.JobNotFound),
+    ):
+        api.open_log_target(cid, cluster=cluster, cache_dir=str(tmp_path))
 
 
 def test_logs_skips_precheck_on_ssh_failure(tmp_path):

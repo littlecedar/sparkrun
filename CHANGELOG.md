@@ -10,6 +10,128 @@ first tagged release containing them, regardless of their original commit date.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-10-25
+
+### Added
+
+- The `cluster monitor` recipe picker groups runtime variants into families (such
+  as `vllm`) and offers an opt-in **All registries** toggle. Enabled registries with
+  `Stemless: no` then appear in recipe searches and registry filter choices.
+- `model-cache reconcile MODEL` / `--all` releases workload claims whose workload is
+  gone. It previews by default (`--apply` releases) and releases a claim only when a
+  status sweep observed every claimed host without the workload, the claim is this
+  controller's, no unswept executor or pending operation could hold it, and it is older
+  than `--min-age-minutes` (default 60). The manual single-claim form is now
+  `reconcile --claim`, which, like `pin`, accepts a ref such as `main`.
+- `model-cache prune` sizes and the `model_cache_prune` config accept human-readable
+  values (`500G`, `1.5TiB`, `500GB`). `list` and `delete` point claimed revisions at
+  `reconcile` before `--force`, and every `model-cache` option has help text.
+- Native vLLM, SGLang, Atlas and MAX launches check a local model directory (an absolute
+  `model:` or `resolved_model_path`) on every target before replacing a running workload:
+  readable `config.json`, weight files and the shards its index names, and the other
+  files of a split GGUF. Docker and local executors also check access through the
+  workload's mounts and user. A local model with no known revision renders
+  `{launch.model_revision}` as an empty string.
+- Application profiles can declare default plugins, installed through the managed plugin
+  lifecycle when missing, with persistent opt-outs (`plugins.defaults.enabled`,
+  `plugins.defaults.suppressed`, `SPARKRUN_NO_DEFAULT_PLUGINS`) and `plugins sync`. The
+  stock sparkrun profile declares none, so this changes nothing for sparkrun itself.
+
+### Changed
+
+- Concurrent preparations of the same model wait for the holder's publication lease
+  instead of failing, and the wait names the holding controller, PID and operation.
+  Warm launches no longer take the control-machine cache lease.
+
+### Fixed
+
+- Relaunching a workload under the same id no longer drops the earlier launch's model
+  cache claims, which `stop` could then never release and which blocked deletes.
+- A same-id relaunch releases the earlier launch's model cache claims on hosts where the
+  replacement confirmed that launch is gone, instead of carrying them forward (each
+  restart of an `export systemd` unit added one, protecting every older revision from
+  pruning). `stop` also tears the id down on hosts only an earlier launch used, so their
+  claims are released, and warns (naming `model-cache reconcile`) when a host could not
+  confirm.
+- `model-cache reconcile --all` keeps claims whose workload may run under an executor
+  this controller has turned off (for example `executor.local`, possibly launched by
+  another controller). Claims now record their executor; for older claims, a job record
+  here naming a swept executor decides. A 5-minute allowance for clock skew is added to
+  `--min-age-minutes`.
+- Waiting on another preparation's publication lease is bounded:
+  `model_cache_lease_timeout_s` (cluster: `distribution.model.lease_timeout_s`), default
+  24 hours, 0 for no limit. On a shared NFS cache reached through two hosts, a launch no
+  longer waits forever on its own lease.
+- `model_cache_prune.max_bytes` rejects 0, which pruned every eligible revision; set
+  `enabled: false` to stop pruning.
+- `cluster monitor` launches no longer narrow the scheduler's candidates to its own
+  displayed placement, so a relaunch evicts the copy it replaces wherever it runs and
+  derives the same workload id as `sparkrun run`. The launch reuses the dialog's plan
+  instead of planning again.
+- `cluster monitor` launches run the recipe's post-launch lifecycle (`post_exec`,
+  readiness, `stop_after_post`). Recipes with `post_commands`, which run on this machine
+  with the terminal, are refused there with a pointer to `sparkrun run`.
+- Quitting `cluster monitor` while a launch or stop is in flight asks first, and after
+  the screen is restored says what it is waiting for. Workers that finish after exit
+  no longer print a traceback.
+
+- Recipe catalogs disambiguate same-stem variants within a registry using their
+  full relative paths. Listing, detail views, and shell completion preserve these
+  choices; unique recipes keep their short names, including under search filters.
+- Recipe listings and search read `metadata.description`, including inherited
+  multiline descriptions, so the monitor picker no longer shows "no description"
+  for those recipes.
+- `cluster monitor` respects scheduler-approved shared GPU placements and workload
+  reuse even when no GPU is wholly unused. The run dialog can recheck rejected hosts
+  after parameter edits or capacity recovery, and cleared image/environment overrides
+  no longer survive a failed or cancelled launch attempt.
+- Monitor log-metric polls finish across slow reads and publish completed workloads
+  without waiting for other workloads. Missing samples no longer shift a source's
+  history into later polling windows, and TensorFold's speculative acceptance rate
+  uses accepted tokens divided by total drafted tokens.
+- On a controller with no `ssh.key`, the setup wizard now verifies key-based SSH with
+  the key it just generated and installed. It re-probed without it, reported every host
+  as "Still failing", and skipped all later setup steps as unreachable.
+- `uvx sparkrun setup install` writes tab-completion for the installed tool instead of
+  the first `sparkrun` on PATH, which under uvx is uvx's throwaway copy in the uv cache.
+  After `uv cache clean`, that broke every new shell.
+- Launching an untrusted recipe from `cluster monitor` now shows what its trust checkbox
+  authorizes: the recipe's hooks and its container-isolation overrides (host mounts,
+  privileged mode, executor selection, pre-placed paths), as `sparkrun run` does. The
+  checkbox previously listed only the hooks, and rendered recipe text as markup, so a
+  hook could restyle or hide what was shown.
+- `cluster monitor` no longer exits with a markup error when a recipe description,
+  model name, typed override or error message contains square brackets (`[/think]`,
+  `[/]`); such text is displayed as written.
+- Local HF model directories that keep a `pytorch_model.bin.index.json` beside their
+  safetensors weights (for example, a download filtered to `*.safetensors` and `*.json`)
+  pass the new pre-launch check again. Like the loaders, it reads the safetensors index
+  when one exists.
+- `setup rdma-test --suite nccl|all` no longer hangs for its full 10-minute budget on
+  clusters where a host runs docker bridge networks. Open MPI advertised those unroutable
+  `br-*` addresses and blocked in `MPI_Init`; its TCP traffic is now pinned to the
+  hosts' shared management subnet. The collective drops the page cache first, as a launch
+  does, so a host whose cache filled free memory no longer fails with CUDA out of memory.
+  Timeouts and out-of-memory failures are named in the report.
+- `setup rdma-test` distributes its test image the way a launch does: the cluster's
+  transfer mode and interface, image-distribution plugins such as OCI Relay, and offline
+  mode (`--offline/--online`, or the cluster's `offline:`). Previously every host pulled
+  from the registry itself. It also connects as the cluster's `user:` (an explicit
+  `--user` still wins); it used config or the local login, so it failed on clusters
+  whose login differs.
+- `setup rdma-test` reports progress through its long steps: a `[k/N]` line as each host
+  pair finishes, and a periodic "still running" line with elapsed time during the image
+  fetch and the NCCL collective. NCCL bus bandwidth is shown in Gb/s beside GB/s
+  (`--json`: `avg_bus_bw_gbits`), so it reads against the link rates.
+  The inventory line breaks its counts down as hosts, shared subnets, pairs and paths
+  (`4 hosts reached on 2 subnets (6 pairs, 12 paths; switch topology)`), and notes when
+  `--suite nccl` does not measure them.
+- SGLang FP8 kernel tuning streams its output again at default verbosity, and a failed
+  tune logs its captured output. Since the monitor terminal fix, it only streamed with `-v`.
+- Re-running `setup install` also repairs existing generated completion entries in
+  Bash, Zsh, and Fish to point at the installed tool, including stale uvx cache paths.
+  Surrounding shell settings and custom completion commands are preserved.
+
 ## [0.4.1] — 2026-10-19
 
 ### Added
@@ -103,6 +225,63 @@ first tagged release containing them, regardless of their original commit date.
   drift checks for all ten operations.
 - Monitor subscriptions reopen when a cluster's executor or transport changes,
   while continuing to share sessions for overlapping host selections.
+- `cluster monitor`: the stop-workload modal's buttons are theme-visible, centered,
+  and reachable with the arrow keys (the y/n shortcuts and hint line are gone);
+  the recipe picker's search field is no longer clipped to one row, and `r` opens
+  it from the workload list as well as the host table.
+- The log pane's `pp` metric reads SGLang's own `input throughput (token/s)`
+  field — the engine's prompt-processing throughput over the interval since its
+  previous prefill print — instead of recomputing a rate from log timestamps,
+  so the footer matches the number the engine logs.
+- The dump-logs modal has Cancel and OK buttons beside its path field. OK runs
+  the same validation as Enter, including the overwrite confirmation; it is
+  disabled while a dump runs, and Cancel closes the modal (cancelling an
+  in-flight dump).
+- The recipe picker runs a progress-only runtime-checks modal — a progress bar
+  and Cancel — while the scheduler placement, each candidate host's availability
+  (reachable, free slots), and its memory fit are computed. It closes itself as
+  soon as they finish and the parameters modal opens; Cancel returns to the
+  picker and discards a late result. A host that is unreachable, has no free
+  slot, or cannot hold the recipe is rendered disabled and unchecked in the
+  hosts grid, with the reason beside its label. A plan that fails because the
+  scheduler rejected every candidate follows the same rule instead of
+  pre-checking hosts a launch would fail on. Hosts are laid out in a
+  multi-column grid that collapses to one column on narrow terminals, and its
+  heading names the scheduler that placed the workload. The
+  modal carries a `Querying scheduler...` title, and pressing Run in the
+  parameters modal re-runs the whole check with the final options — placement,
+  availability, and memory fit — before launching: a host that lost its capacity
+  or became unreachable in the meantime returns to the settings with its row
+  disabled and unchecked and the reason in the error line, and a plan that fails
+  does the same instead of launching. Cancel keeps the settings (with the typed
+  values) open and discards the late result.
+- The picker's metadata box shows only launch-decision fields — recipe name,
+  model, runtime, minimum nodes, tensor parallel, and GPU memory utilization —
+  in that order, with the description rendered last in dim text and given every
+  remaining row. Path and other provenance internals are no longer shown. The
+  filter and metadata boxes share one row and therefore one height, while the
+  search bar and the recipe list each own a full-width row beneath them. A mouse
+  click on a recipe row only highlights it (the info box follows the pointer);
+  clicking the highlighted row, or pressing enter, opens the run configuration.
+- The monitor's run-parameters modal uses typed integer/number inputs, keeps short
+  fields at 20% beside hosts and long fields at 80%, and an Advanced checkbox
+  reveals every recipe default and launch knob (pipeline/data parallel, scheduler,
+  workload id, image, served model name, cache dir, memory limit, labels, extra
+  docker options, offline, dry run, ensure, tuning sync, rootful, auto port).
+  The Advanced checkbox sits in the dialog's action row, left of Cancel.
+  Labels and placeholders are compact (`Image`, `Docker opts`, `Reuse job`,
+  `default`, `auto`), the hosts summary reads `3/4 selected · dense-pack`, plan
+  notes share that single line, and the overrides field is just
+  `Overrides (-o key=value)`.
+  Placeholders show the plain default value; the modal and the stop dialog use a
+  neutral elevated background instead of the accent-tinted `$panel`, which
+  restored body-text contrast.
+- A successful recipe launch in the monitor opens that workload's log pane as soon
+  as `run()` returns, resolving the host/container from the freshly written job
+  metadata; the occupancy-poll fallback now waits 60 seconds before falling back
+  to a notification.
+- Log handlers attached to named library loggers are parked for the monitor's
+  lifetime, so their output cannot paint over the TUI during a launch.
 
 - Proxy discovery reports successful imports with routing warnings separately from
   failed sweeps. With the coordinated SparkRoute gateway/plugin, public-name
@@ -1151,7 +1330,8 @@ the post-launch lifecycle are unchanged for existing recipes.
 
 [0.3.0]: https://github.com/spark-arena/sparkrun/releases/tag/v0.3.0
 
-[Unreleased]: https://github.com/spark-arena/sparkrun/compare/v0.4.1...develop-next
+[Unreleased]: https://github.com/spark-arena/sparkrun/compare/v0.4.2...develop-next
+[0.4.2]: https://github.com/spark-arena/sparkrun/releases/tag/v0.4.2
 [0.4.1]: https://github.com/spark-arena/sparkrun/releases/tag/v0.4.1
 [0.3.1]: https://github.com/spark-arena/sparkrun/releases/tag/v0.3.1
 [0.3.2]: https://github.com/spark-arena/sparkrun/releases/tag/v0.3.2

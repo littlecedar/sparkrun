@@ -5968,6 +5968,43 @@ class TestStopLogsClusterIdAndOverrides:
         # Metadata is kept: the workload may still be running.
         assert (jobs_dir / "aabbccdd1122eeff_0123456789ab.yaml").exists()
 
+    def test_stop_warns_when_an_earlier_launchs_claims_cannot_be_released(self, runner, config_setup):
+        """The workload's own hosts confirmed, so the stop succeeds; the claim left
+        on a host only an earlier same-id launch used is a warning, not silence."""
+        from sparkrun.orchestration.ssh import RemoteResult
+
+        jobs_dir = config_setup["cache_root"] / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "cluster_id": "sparkrun_aabbccdd1122eeff_0123456789ab",
+            "recipe": "test-recipe",
+            "model": "test/model",
+            "runtime": "sglang",
+            "hosts": ["10.0.0.1"],
+            "model_cache_claims": [
+                {"host": host, "cache_root": "/hf", "repo": "org/m", "revision": "a" * 40, "claim": claim}
+                for host, claim in (("10.0.0.1", "latest"), ("10.0.0.9", "earlier"))
+            ],
+        }
+        (jobs_dir / "aabbccdd1122eeff_0123456789ab.yaml").write_text(yaml.safe_dump(meta))
+
+        def cleanup(host_containers, ssh_kwargs=None, dry_run=False, max_workers=None, *, executor=None):
+            return {
+                h: RemoteResult(host=h, returncode=255 if h == "10.0.0.9" else 0, stdout="sparkrun_removed=0\n", stderr="No route to host")
+                for h in host_containers
+            }
+
+        with (
+            mock.patch("sparkrun.orchestration.primitives.cleanup_containers_by_host", side_effect=cleanup),
+            mock.patch("sparkrun.models.usage.release_claims") as release,
+        ):
+            result = runner.invoke(main, ["stop", "aabbccdd1122eeff_0123456789ab"])
+
+        assert result.exit_code == 0, result.output
+        assert set(release.call_args.kwargs["hosts"]) == {"10.0.0.1"}
+        assert "Warning:" in result.output and "model-cache reconcile --all" in result.output and "10.0.0.9" in result.output
+        assert (jobs_dir / "aabbccdd1122eeff_0123456789ab.yaml").exists()
+
     def test_stop_by_cluster_id_no_metadata_no_hosts(self, runner, config_setup):
         """Stop by unknown cluster ID with no resolvable hosts shows helpful error."""
         result = runner.invoke(main, ["stop", "deadbeef1234"])

@@ -1179,6 +1179,15 @@ def cluster_check_job(ctx, target, hosts, hosts_file, cluster_name, tp_override,
         elif meta and meta.get("hosts"):
             host_list = meta["hosts"]
 
+        # The job's cluster (named, else the one it recorded) supplies the
+        # saved hardware inventory the status query needs, as ``stop`` /
+        # ``logs`` recover it.
+        host_hardware = None
+        if host_list:
+            from sparkrun.api._resolve import resolve_cluster_for_job
+
+            host_hardware = resolve_cluster_for_job(cluster_name, host_list, meta=meta, sctx=sctx).hosts_hardware or None
+
         status = check_job_running(
             cluster_id=cid,
             hosts=host_list,
@@ -1186,6 +1195,7 @@ def cluster_check_job(ctx, target, hosts, hosts_file, cluster_name, tp_override,
             cache_dir=str(config.cache_dir),
             check_http_models=check_http_models,
             port=port,
+            host_hardware=host_hardware,
         )
     else:
         # --- Recipe path ---
@@ -1221,6 +1231,7 @@ def cluster_check_job(ctx, target, hosts, hosts_file, cluster_name, tp_override,
                 cache_dir=str(config.cache_dir),
                 check_http_models=check_http_models,
                 port=port,
+                host_hardware=cluster_def.hosts_hardware or None,
             )
 
     # --- Output ---

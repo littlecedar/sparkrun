@@ -9,7 +9,7 @@ import threading
 
 from sparkrun.models.artifacts import ModelArtifactError, ModelArtifactManifest
 from sparkrun.models.manifest import STATE_DIRECTORY
-from sparkrun.models._publication import PublicationLease
+from sparkrun.models._publication import HeldThroughAlias, PublicationLease
 from sparkrun.models.observation import observation_script, parse_observations, path_assignment
 from sparkrun.transports.session import HostCommandResult, HostSession, HostSessionError, SshHostSession, StreamingHostSession
 
@@ -53,6 +53,18 @@ class ModelHostIO:
         except ModelArtifactError:
             return True
         return False
+
+    def release_leases(self):
+        """End a preparation phase before acquiring a larger, ordered lock set.
+
+        Callers must re-observe after reacquisition. A lost lease is terminal,
+        even here; releasing it must never turn failure into a successful retry.
+        """
+        with self._mutex:
+            self.check_leases()
+            self._stack.close()
+            self._owners.clear()
+            self._locks.clear()
 
     def execute(
         self,
@@ -161,6 +173,8 @@ class ModelHostIO:
             if key in self._locks:
                 return self._locks[key]
             existing = self.read(host, path)
+            if existing:
+                existing = existing.splitlines()[0]
             if existing is not None and existing in self._owners:
                 self.check_leases()
                 self._locks[key] = existing
@@ -168,8 +182,27 @@ class ModelHostIO:
             session = self.local if host is None else self.session
             if not isinstance(session, StreamingHostSession):
                 raise ModelArtifactError("model publication requires a host session with supervised streaming leases")
+            from sparkrun.core.model_distribution import lease_timeout
+
             nonce = self._operation + ":" + uuid.uuid4().hex
-            owner = PublicationLease(session, host, cache, path, nonce)
+            try:
+                owner = PublicationLease(
+                    session,
+                    host,
+                    cache,
+                    path,
+                    nonce,
+                    check=self.check_leases,
+                    owned=self._owners.__contains__,
+                    acquire_timeout=lease_timeout(),
+                    timeout_setting="model_cache_lease_timeout_s",
+                )
+            except HeldThroughAlias as alias:
+                # The read above saw the lock before our holder's nonce was
+                # visible through this name (NFS attribute caching).
+                self.check_leases()
+                self._locks[key] = alias.nonce
+                return alias.nonce
             self._stack.callback(owner.process.close)
             self._owners[nonce] = owner
             self._locks[key] = nonce

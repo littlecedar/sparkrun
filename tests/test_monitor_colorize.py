@@ -235,6 +235,17 @@ TENSORFOLD_LINES = [
     "[tensorfold] refused cmpl-1: model not found",
     "[tensorfold] ended chatcmpl-1 reason=error (OutOfMemory) prompt=12 tokens=0 after=1.25s",
     '[tensorfold] 10.0.0.5 "POST /v1/chat/completions HTTP/1.1" 503 -',
+    # Real workload log, 2026-10-17: launcher boot line and a completed request,
+    # plus a max-token cut-off (the log's own finish=length line); the client
+    # cancellation is log.zig's own test string for its ``ended`` helper.
+    "[tensorfold-launcher] boot: node_rank=0/2 rendezvous=10.0.4.34:25000"
+    " model=/cache/runtime/tensorfold/model-overlay serving=0.0.0.0:8000"
+    " context=1048576 engram=/cache/huggingface/hub/dsv41-engram",
+    "[tensorfold] done req-477975f9986c prompt=43 cached=0 thinking=True tokens=19"
+    " sha=e96a676a795c finish=stop tok/s=62.2 ttft=0.18s prefill=0.17s rounds=7 accepted=11/23",
+    "[tensorfold] done req-0f5d78cbbc06 prompt=2048 cached=0 thinking=True tokens=128"
+    " sha=f9b521598a86 finish=length tok/s=64.6 ttft=2.27s prefill=2.26s rounds=53 accepted=74/123",
+    "[tensorfold] ended req-1 reason=client-left prompt=12 tokens=3 after=0.50s",
     "tensorfold: cannot listen on 127.0.0.1:8080 (AddressInUse)",
 ]
 
@@ -296,6 +307,27 @@ def test_tensorfold_fatal_is_whole_line_and_semantics_are_specific():
 
     warning = "[tensorfold] warning: open"
     assert ("warning:", "yellow") in _pairs(TensorFoldColorizer().spans(warning), warning)
+
+
+def test_tensorfold_launcher_and_outcome_tokens_colorize():
+    colorizer = TensorFoldColorizer()
+    launcher = next(text for text in TENSORFOLD_LINES if text.startswith("[tensorfold-launcher]"))
+    assert colorizer.recognizes(launcher)
+    assert ("[tensorfold-launcher]", "bold blue") in _pairs(colorizer.spans(launcher), launcher)
+
+    for text in TENSORFOLD_LINES:
+        pairs = _pairs(colorizer.spans(text), text)
+        if "finish=stop" in text:
+            assert ("finish=stop", "green") in pairs, pairs
+        if "finish=length" in text:
+            assert ("finish=length", "yellow") in pairs, pairs
+        if "reason=client-left" in text:
+            assert ("reason=client-left", "dim") in pairs, pairs
+
+    done_stop = next(text for text in TENSORFOLD_LINES if "finish=stop" in text)
+    pairs = _pairs(colorizer.spans(done_stop), done_stop)
+    assert ("accepted=11/23", "yellow") in pairs  # one data span, not just the numerator
+    assert ("sha=e96a676a795c", "magenta") in pairs  # hex hash: not digit-leading
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """Real lease loss, lock-owned publication and cancellation; temporary data only."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import base64
 import os
 import signal
@@ -12,7 +13,7 @@ import pytest
 
 pytest.importorskip("fcntl")
 
-from sparkrun.models import _cache_agent, usage
+from sparkrun.models import _cache_agent, _publication, usage
 from sparkrun.models.artifacts import ModelArtifactError
 from sparkrun.models.host_io import ModelHostIO
 from sparkrun.models.preparation import prepare_model
@@ -38,6 +39,8 @@ def test_lost_lease_is_terminal_including_shared_aliases(tmp_path, alias):
         assert io.cancelled()
         with pytest.raises(ModelArtifactError, match="lease lost"):
             io.lock(alias, str(tmp_path), "org/model")
+        with pytest.raises(ModelArtifactError, match="lease lost"):
+            io.release_leases()
         with pytest.raises(ModelArtifactError, match="lease lost"):
             io.publish(alias, str(tmp_path), "org/model", str(tmp_path / "invalid"), "must not publish")
         assert not (tmp_path / "invalid").exists()
@@ -190,3 +193,135 @@ def test_lease_supervision_preserves_large_metadata_reads(tmp_path):
     with ModelHostIO() as io:
         io.lock("localhost", str(tmp_path), "org/model")
         assert io.read("localhost", str(path)) == contents
+
+
+def wait_until(predicate):
+    deadline = time.monotonic() + 5
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert predicate()
+
+
+def test_contended_acquisition_reports_holder_and_keeps_waiting(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(_publication, "_WAIT_INTERVAL", 0.05)
+    caplog.set_level(_publication.PROGRESS, logger=_publication.__name__)
+    with ModelHostIO() as holder, ThreadPoolExecutor(1) as pool:
+        holder.lock(None, str(tmp_path), "org/model")
+
+        def acquire():
+            with ModelHostIO() as contender:
+                contender.lock(None, str(tmp_path), "org/model")
+                contender.publish(None, str(tmp_path), "org/model", str(tmp_path / "published"), "ready")
+
+        future = pool.submit(acquire)
+        try:
+            wait_until(lambda: caplog.text.count("Waiting for model cache publication lease") >= 3)
+            assert not future.done()
+            assert f"pid {os.getpid()} operation {holder._operation}" in caplog.text
+        finally:
+            holder.release_leases()
+        future.result(timeout=5)
+    assert (tmp_path / "published").read_text() == "ready"
+
+
+def test_acquisition_failure_is_not_reported_as_lost_lease(tmp_path):
+    root = tmp_path / "not-a-directory"
+    root.write_text("file")
+    with closing(SshHostSession()) as session:
+        with pytest.raises(ModelArtifactError, match="could not acquire") as exc:
+            _publication.PublicationLease(session, None, str(root), str(root / "repo.lock"), "nonce")
+        assert "lease lost" not in str(exc.value)
+        assert not session._processes
+
+
+def test_waiting_acquisition_is_cancellable_without_affecting_holder(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(_publication, "_WAIT_INTERVAL", 0.05)
+    caplog.set_level(_publication.PROGRESS, logger=_publication.__name__)
+    cancel = threading.Event()
+
+    def interrupt():
+        if cancel.is_set():
+            raise KeyboardInterrupt
+
+    with ModelHostIO() as holder, closing(SshHostSession()) as session, ThreadPoolExecutor(1) as pool:
+        nonce = holder.lock(None, str(tmp_path), "org/model")
+        path = tmp_path / _cache_agent.STATE / "org--model.lock"
+        future = pool.submit(_publication.PublicationLease, session, None, str(tmp_path), str(path), "contender", check=interrupt)
+        try:
+            wait_until(lambda: "Waiting for model cache publication lease" in caplog.text)
+        finally:
+            cancel.set()
+        with pytest.raises(KeyboardInterrupt):
+            future.result(timeout=5)
+        holder.check_leases()
+        assert holder.lock("localhost", str(tmp_path), "org/model") == nonce
+        assert not session._processes
+        assert session.execute("localhost", ["true"]).returncode == 0
+
+
+def test_waiting_acquisition_supervises_previously_acquired_leases(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(_publication, "_WAIT_INTERVAL", 0.05)
+    caplog.set_level(_publication.PROGRESS, logger=_publication.__name__)
+    with ModelHostIO() as blocker, ThreadPoolExecutor(1) as pool:
+        blocker.lock(None, str(tmp_path / "second"), "org/model")
+        with pytest.raises(ModelArtifactError, match="lease lost"), ModelHostIO() as contender:
+            contender.lock(None, str(tmp_path / "first"), "org/model")
+            future = pool.submit(contender.lock, None, str(tmp_path / "second"), "org/model")
+            try:
+                wait_until(lambda: "Waiting for model cache publication lease" in caplog.text)
+                kill_holder(contender)
+                with pytest.raises(ModelArtifactError, match="lease lost"):
+                    future.result(timeout=5)
+                assert not contender.local._processes - {owner.process.process for owner in contender._owners.values()}
+            finally:
+                blocker.release_leases()
+
+
+def test_alias_that_cannot_yet_see_our_nonce_reuses_the_lease(tmp_path, monkeypatch):
+    # On NFS the second name may read the lock file before the holder's nonce
+    # is visible there; it then flocks against our own lease. It must
+    # recognize the holder as itself instead of waiting forever.
+    monkeypatch.setattr(_publication, "_WAIT_INTERVAL", 0.05)
+    cache = tmp_path / "actual"
+    cache.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(cache, target_is_directory=True)
+    with ModelHostIO() as io:
+        first = io.lock("localhost", str(cache), "org/model")
+        assert (cache / _cache_agent.STATE / "org--model.lock").read_text().splitlines()[0] == first
+        original = io.read
+        monkeypatch.setattr(io, "read", lambda host, path: None if path.endswith(".lock") else original(host, path))
+        assert io.lock("127.0.0.1", str(alias), "org/model") == first
+        assert len(io._owners) == 1
+        io.publish("127.0.0.1", str(alias), "org/model", str(alias / "published"), "ready")
+    assert (cache / "published").read_text() == "ready"
+
+
+def test_busy_lease_wait_gives_up_after_the_configured_ceiling(tmp_path, monkeypatch):
+    monkeypatch.setattr(_publication, "_WAIT_INTERVAL", 0.05)
+    monkeypatch.setattr("sparkrun.core.model_distribution.lease_timeout", lambda config=None: 0.2)
+    with ModelHostIO() as holder:
+        holder.lock(None, str(tmp_path), "org/model")
+        with ModelHostIO() as contender:
+            with pytest.raises(ModelArtifactError, match="model_cache_lease_timeout_s") as exc:
+                contender.lock(None, str(tmp_path), "org/model")
+            assert f"operation {holder._operation}" in str(exc.value)
+            assert not contender._owners
+        holder.check_leases()
+
+
+def test_lease_timeout_setting():
+    from sparkrun.core.cluster_manager import ClusterDefinition, ClusterDistributionConfig, ResourceDistributionPrefs
+    from sparkrun.core.config import SparkrunConfig
+    from sparkrun.core.model_distribution import DEFAULT_MODEL_CACHE_LEASE_TIMEOUT_S, lease_timeout
+
+    assert lease_timeout(SparkrunConfig()) == DEFAULT_MODEL_CACHE_LEASE_TIMEOUT_S
+    assert lease_timeout({"model_cache_lease_timeout_s": 0}) is None
+    assert lease_timeout({"model_cache_lease_timeout_s": 90}) == 90
+    for bad in (-1, float("inf"), "1h", True):
+        with pytest.raises(ModelArtifactError, match="model_cache_lease_timeout_s"):
+            lease_timeout({"model_cache_lease_timeout_s": bad})
+    prefs = ResourceDistributionPrefs.from_dict({"lease_timeout_s": 600})
+    assert prefs.to_dict() == {"lease_timeout_s": 600} and not prefs.is_default()
+    cluster = ClusterDefinition(name="c", hosts=["a"], distribution=ClusterDistributionConfig(model=prefs))
+    assert lease_timeout(SparkrunConfig().for_cluster(cluster)) == 600

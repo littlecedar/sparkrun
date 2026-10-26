@@ -408,6 +408,35 @@ def test_recipe_summary_bare_name(tmp_path):
     assert summary["name"] == "my-recipe"
 
 
+@pytest.mark.parametrize("block_style, expected", [(">-", "First line. Second line."), ("|", "First line.\nSecond line.\n")])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_recipe_summary_metadata_multiline_description(tmp_path, block_style, expected, inherited):
+    base = tmp_path / "base.yaml"
+    base.write_text(f"model: org/model\nruntime: sglang\nmetadata:\n  description: {block_style}\n    First line.\n    Second line.\n")
+    path = base
+    if inherited:
+        path = tmp_path / "variant.yaml"
+        path.write_text("include: base\nmodel: org/variant\n")
+    summary = recipe_summary(path)
+    assert summary is not None
+    assert summary["description"] == expected
+    assert summary["description"] == Recipe.load(path).description
+
+
+@pytest.mark.parametrize("top_level", ["Explicit description", "", None])
+def test_recipe_summary_description_precedence(tmp_path, top_level):
+    path = tmp_path / "recipe.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"model": "org/model", "runtime": "sglang", "description": top_level, "metadata": {"description": "Metadata description"}}
+        )
+    )
+    summary = recipe_summary(path)
+    assert summary is not None
+    assert summary["description"] == (top_level or "Metadata description")
+    assert summary["description"] == Recipe.load(path).description
+
+
 def test_recipe_slug(tmp_path):
     """Test slug generation from recipe names (filename stems).
 

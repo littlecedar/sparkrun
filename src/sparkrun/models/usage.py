@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 class UsageScope:
     token: str = field(default_factory=lambda: uuid.uuid4().hex)
     workload: str | None = None
+    executor: str | None = None
     activated: bool = False
     claims: list[dict] = field(default_factory=list)
     ssh_kwargs: dict = field(default_factory=dict)
@@ -55,6 +56,17 @@ def begin_workload(cluster_id, ssh_kwargs):
     if scope is not None:
         scope.workload = cluster_id
         scope.ssh_kwargs = dict(ssh_kwargs)
+
+
+def set_workload_executor(name):
+    """Record the executor the workload runs under in its claims.
+
+    ``model-cache reconcile`` then requires that executor's status to have
+    been swept before it reads the workload as gone.
+    """
+    scope = _SCOPE.get()
+    if scope is not None:
+        scope.executor = name if isinstance(name, str) and name else None
 
 
 def activate_workload():
@@ -136,6 +148,8 @@ def _claim(record, host, root, repo, revision):
     scope = _SCOPE.get()
     if scope is not None and scope.workload and host is not None:
         claim = record["claims"].setdefault(scope.token, {"workload": scope.workload, "hosts": [], "created": time.time()})
+        if scope.executor:
+            claim.setdefault("executor", scope.executor)
         claim["hosts"] = sorted(set(claim["hosts"]) | {host})
         reference = {"host": host, "cache_root": root, "repo": repo, "revision": revision, "claim": scope.token}
         if reference not in scope.claims:

@@ -105,7 +105,9 @@ def render_env_template(template: str, config: Mapping[str, Any], launch: Mappin
             namespace, key = name.split(".", 1)
             source = config if namespace == "config" else launch
             value = source.get(key)
-            if value is None or (namespace == "launch" and value == ""):
+            # A resolved local checkpoint need not have an HF revision. Empty
+            # paths and missing launch facts still indicate preparation errors.
+            if value is None or (namespace == "launch" and value == "" and key != "model_revision"):
                 raise ValueError("unavailable env template field: " + name)
             if not isinstance(value, (str, int, float, bool)):
                 raise ValueError("env template field must be a scalar: " + name)

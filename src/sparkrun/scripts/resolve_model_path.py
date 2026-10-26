@@ -1,18 +1,111 @@
 """Read a prepared HF snapshot on the target. Stdlib-only; no downloads."""
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
 
-def resolve_model_path(model, revision, cache_dir, expected_revision=""):
-    """Return an exact host-side model path and concrete HF commit."""
+def _readable_file(path):
+    if not path.is_file():
+        raise ValueError("missing or non-regular model file: " + str(path))
+    try:
+        # Open as the executing user, rather than trusting permission bits.
+        # Do not read or hash the weight payload.
+        with path.open("rb"):
+            pass
+    except OSError as exc:
+        raise ValueError("unreadable model file: %s (%s)" % (path, exc)) from exc
+
+
+def _json_object(path):
+    _readable_file(path)
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError) as exc:
+        raise ValueError("invalid or unreadable model JSON: %s (%s)" % (path, exc)) from exc
+    if not isinstance(data, dict):
+        raise ValueError("model JSON must be an object: " + str(path))
+    return data
+
+
+def validate_local_model(path: Path, model_format: str = "auto") -> list[str]:
+    """Check basic usability, without inventing an inventory or revision.
+
+    Native HF loaders request ``hf``. ``auto`` recognizes HF directories by
+    config.json; ``opaque`` leaves other runtimes' directory layouts alone.
+    GGUF files, including split files, are recognized in all modes.
+    """
+    if not path.exists():
+        raise ValueError("local model path does not exist: " + str(path))
+    if not path.is_dir():
+        _readable_file(path)
+        files = {str(path)}
+        if path.suffix.lower() == ".gguf":
+            match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", path.name, re.IGNORECASE)
+            if match:
+                total = int(match[3])
+                if not 1 <= int(match[2]) <= total:
+                    raise ValueError("invalid GGUF shard name: " + str(path))
+                for i in range(1, total + 1):
+                    shard = path.with_name(f"{match[1]}-{i:05}-of-{total:05}{path.suffix}")
+                    _readable_file(shard)
+                    files.add(str(shard))
+        elif model_format == "hf":
+            raise ValueError("expected an HF model directory or GGUF file: " + str(path))
+        return sorted(files)
+
+    config = path / "config.json"
+    if model_format == "opaque" or (model_format != "hf" and not config.exists() and not config.is_symlink()):
+        # Enumerating checks directory access without requiring a particular
+        # layout for compiled engines or third-party runtime formats.
+        with os.scandir(path):
+            pass
+        return []
+    _json_object(config)
+    files = {str(config)}
+    # Choose the index the way the loaders choose weights: safetensors first.
+    # A download filtered to "*.safetensors" + "*.json" keeps the
+    # pytorch_model.bin index (it is JSON) without the .bin shards it names,
+    # and the loaders never read it, so requiring its shards refused a usable
+    # checkpoint.
+    indexes = sorted(path.glob("*.safetensors.index.json")) or sorted(path.glob("*.index.json"))
+    if indexes:
+        for index in indexes:
+            weights = _json_object(index).get("weight_map")
+            files.add(str(index))
+            if not isinstance(weights, dict) or not weights:
+                raise ValueError("checkpoint index has no valid weight map: " + str(index))
+            for name in weights.values():
+                if not isinstance(name, str) or not name or "\x00" in name:
+                    raise ValueError("invalid weight file in checkpoint index: " + str(index))
+            for name in sorted(set(weights.values())):
+                relative = Path(name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("invalid weight file %r in checkpoint index: %s" % (name, index))
+                _readable_file(path / relative)
+                files.add(str(path / relative))
+    else:
+        weights = sorted({p for pattern in ("*.safetensors", "*.bin", "*.pt", "*.gguf") for p in path.glob(pattern)})
+        if not weights:
+            raise ValueError("no model weight files found in: " + str(path))
+        for weight in weights:
+            _readable_file(weight)
+            files.add(str(weight))
+    return sorted(files)
+
+
+def resolve_model_path(model, revision, cache_dir, expected_revision="", local_format="auto", include_local_files=False):
+    """Return an exact model path and HF commit, or an empty local revision."""
     if Path(model).is_absolute():
         path = Path(model)
         if not path.exists():
-            raise ValueError("local model path does not exist")
-        return {"path": str(path), "revision": ""}
+            raise ValueError("local model path does not exist: " + str(path))
+        result: dict[str, str | list[str]] = {"path": str(path), "revision": ""}
+        if include_local_files:
+            result["files"] = validate_local_model(path, local_format)
+        return result
     repo, separator, quant = model.partition(":")
     if any(part in ("", ".", "..") for part in repo.split("/")) or len(repo.split("/")) != 2:
         raise ValueError("model must be a local absolute path or org/repository")

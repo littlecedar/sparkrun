@@ -29,7 +29,13 @@ def plugin_details(plugin):
         origin = plugin_origin(module, plugin.path)
         package = origin.parent if origin else None
         declarations = read_declarations(origin, module)
-    return {"module": module, "package": str(package) if package else None, "metadata": metadata, "declarations": declarations}
+    return {
+        "module": module,
+        "package": str(package) if package else None,
+        "metadata": metadata,
+        "declarations": declarations,
+        "default_managed": plugin.managed and plugin.source == "default-managed",
+    }
 
 
 def validate_activation(plugin, config):
@@ -73,6 +79,7 @@ def _run_worker(config, request, *, timeout=60):
             **child_environment(config_path=config.config_path),
             "PYTHONDONTWRITEBYTECODE": "1",
             "SPARKRUN_NO_TELEMETRY": "1",
+            "SPARKRUN_NO_DEFAULT_PLUGINS": "1",
         }
         try:
             result = subprocess.run(
@@ -114,7 +121,7 @@ def run_hook(config, plugin_id, details, event, *, feature=None, previous=None, 
             raise ValueError("messages must be strings")
         if any(not isinstance(k, str) or not k.startswith("plugins." + plugin_id + ".") for k in plan.settings):
             raise ValueError("hooks may only change their own plugin settings")
-        if plan.settings and (plugin_id in {"enabled", "paths"} or any(not all(k.split(".")) for k in plan.settings)):
+        if plan.settings and (plugin_id in {"enabled", "paths", "defaults"} or any(not all(k.split(".")) for k in plan.settings)):
             raise ValueError("hooks cannot write reserved or empty plugin setting paths")
         if plan.proxy and (event != "feature.enable" or set(plan.proxy) != {"gateway"}):
             raise ValueError("only explicit feature enable may select a gateway")
@@ -154,6 +161,29 @@ def change_plugin(config, selector, enabled, *, dry_run=False):
 
     store = PluginStore(config)
     with management_transaction(store, dry_run) as (config, records, baseline):
+        from sparkrun.core.plugin_defaults import default_plugins, suppress_default
+
+        identifier = normalize_plugin_id(selector)
+        default = next((entry for entry in default_plugins(config.profile) if entry.name == identifier), None)
+        if default is not None and not any(p.plugin_id == identifier for p in _plugins(config)):
+            state = plugin_state(identifier, config, source="default-managed")
+            if not enabled and state.required:
+                raise PluginError("Plugin %s is required by this application and cannot be disabled" % identifier)
+            set_plugin_override(config, identifier, enabled)
+            if enabled:
+                state = plugin_state(identifier, config, source="default-managed")
+                if not state.enabled:
+                    raise PluginError("Cannot enable %s: %s" % (identifier, state.reason))
+                suppress_default(config, identifier, False)
+            if dry_run:
+                return {"name": identifier, "status": "planned", "enabled": enabled}
+            warning = store.commit(records, config, baseline)
+            return {
+                "name": identifier,
+                "status": "enabled" if enabled else "disabled",
+                "messages": ["Run plugins sync or initialize the application to install this default."] if enabled else [],
+                "warning": warning,
+            }
         plugin = find_plugin(config, selector)
         identifier = plugin.plugin_id or normalize_plugin_id(plugin.name)
         current = plugin_state(identifier, config, source=plugin.source)
@@ -171,6 +201,8 @@ def change_plugin(config, selector, enabled, *, dry_run=False):
             validate_activation(plugin, config)
         before = deepcopy(config._data)
         set_plugin_override(config, identifier, enabled)
+        if enabled:
+            suppress_default(config, identifier, False)
         state = plugin_state(identifier, config, source=plugin.source)
         if enabled and not state.enabled:
             raise PluginError("Cannot enable %s: %s" % (identifier, state.reason))

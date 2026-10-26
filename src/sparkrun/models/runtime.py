@@ -12,7 +12,7 @@ from sparkrun.core.env_templates import _mounts, workload_model_path
 from sparkrun.core.model_distribution import prepared_model, prepared_models
 from sparkrun.core.validation import _model_arg_literal
 from sparkrun.models.artifacts import ModelArtifactError
-from sparkrun.models.observation import observation_script, parse_observations
+from sparkrun.models.observation import local_model_access_script, local_model_probe_script, observation_script, parse_observations
 from sparkrun.utils.shell import quote
 
 logger = logging.getLogger(__name__)
@@ -119,18 +119,34 @@ def validate_runtime_command(recipe, overrides, runtime, command: str) -> None:
     )
 
 
-def verify_workload_access(hosts, executors, images, volumes, ssh_kwargs, *, extra_opts=()) -> None:
-    """Observe the same inventory through workload mounts and the effective UID.
+def _access_command(executor, image, script, volumes, extra_opts):
+    hook = getattr(executor, "model_access_command", None)
+    if callable(hook):
+        command = hook(image, script, volumes, list(extra_opts))
+    elif executor.executor_name == "local":
+        command = "printf %s " + quote(script) + " | bash -s"
+    else:
+        raise ModelArtifactError("executor does not support model workload access validation: " + executor.executor_name)
+    if not isinstance(command, str) or not command:
+        raise ModelArtifactError("executor returned an invalid model access command")
+    return command
+
+
+def verify_workload_access(
+    hosts, executors, images, volumes, ssh_kwargs, *, extra_opts=(), local_model_path=None, local_model_format="auto"
+) -> None:
+    """Check model files through workload mounts and the effective UID.
 
     Probes run before eviction, without GPUs or the image entrypoint. Third-party
     executors can supply model_access_command(image, script, volumes, extra_opts).
     They must preserve the final workload's filesystem and identity semantics.
+    Local models without inventories receive readability checks only.
     """
     from sparkrun.models.host_io import ModelHostIO
     from sparkrun.orchestration.executors._seccomp import split_options
 
     bindings = prepared_models()
-    if not bindings:
+    if not bindings and not local_model_path:
         return
     _, tokens, _ = split_options(None, list(extra_opts))
     if any(
@@ -138,7 +154,7 @@ def verify_workload_access(hosts, executors, images, volumes, ssh_kwargs, *, ext
         or t.startswith(("-v", "--volume=", "--mount=", "--tmpfs=", "--volumes-from="))
         for t in tokens
     ):
-        raise ModelArtifactError("validated model access requires structured executor_config.volumes instead of raw mount options")
+        raise ModelArtifactError("model access checks require structured executor_config.volumes instead of raw mount options")
     with ModelHostIO(ssh_kwargs) as io:
         for binding in bindings:
             if binding.host not in hosts:
@@ -147,15 +163,7 @@ def verify_workload_access(hosts, executors, images, volumes, ssh_kwargs, *, ext
             mounts = _mounts(volumes, executor)
             snapshot = workload_model_path(binding.snapshot_path, mounts, executor.executor_name)
             script = observation_script(binding.manifest, snapshot)
-            hook = getattr(executor, "model_access_command", None)
-            if callable(hook):
-                command = hook(images[hosts.index(binding.host)], script, volumes, list(extra_opts))
-            elif executor.executor_name == "local":
-                command = "printf %s " + quote(script) + " | bash -s"
-            else:
-                raise ModelArtifactError("executor does not support model workload access validation: " + executor.executor_name)
-            if not isinstance(command, str) or not command:
-                raise ModelArtifactError("executor returned an invalid model access command")
+            command = _access_command(executor, images[hosts.index(binding.host)], script, volumes, extra_opts)
             result = io.execute(binding.host, command, timeout=90)
             report = parse_observations(
                 binding.host, binding.manifest, result.stdout.decode(errors="replace"), returncode=result.returncode
@@ -168,3 +176,41 @@ def verify_workload_access(hosts, executors, images, volumes, ssh_kwargs, *, ext
                 if stderr:
                     details += "; stderr: " + stderr
                 raise ModelArtifactError("model is inaccessible to workload on %s: %s" % (binding.host, details))
+        if local_model_path:
+            for host, image in zip(hosts, images, strict=True):
+                if any(b.host == host and b.model == local_model_path for b in bindings):
+                    continue  # The authoritative inventory was checked above.
+                executor = executors[host]
+                if executor.executor_name != "local" and not callable(getattr(executor, "model_access_command", None)):
+                    logger.warning("Executor %s cannot check local model access inside the workload on %s", executor.executor_name, host)
+                    continue
+                # Host Python understands config/index JSON. The image only
+                # needs bash to open that file selection as the serving user.
+                # This remains a usability check, not an authoritative binding.
+                result = io.execute(host, local_model_probe_script(local_model_path, local_model_format), timeout=60)
+                if result.returncode:
+                    raise ModelArtifactError(
+                        "local model preflight failed on %s at %s: %s"
+                        % (host, local_model_path, result.stderr.decode(errors="replace").strip()[-1500:])
+                    )
+                try:
+                    lines = result.stdout.decode().splitlines()
+                    data = json.loads(
+                        next(line.removeprefix("SPARKRUN_MODEL_PATH=") for line in lines if line.startswith("SPARKRUN_MODEL_PATH="))
+                    )
+                    files = data["files"]
+                    if not isinstance(files, list) or any(not isinstance(p, str) or not p.startswith("/") or "\x00" in p for p in files):
+                        raise ValueError("invalid local model file selection")
+                except (ValueError, KeyError, TypeError, StopIteration) as exc:
+                    raise ModelArtifactError("invalid local model probe response from " + host) from exc
+                mounts = _mounts(volumes, executor)
+                path = workload_model_path(local_model_path, mounts, executor.executor_name)
+                files = [workload_model_path(file, mounts, executor.executor_name) for file in files]
+                script = local_model_access_script(path, files)
+                command = _access_command(executor, image, script, volumes, extra_opts)
+                result = io.execute(host, command, timeout=90)
+                if result.returncode:
+                    raise ModelArtifactError(
+                        "local model is inaccessible to workload on %s at %s (rc=%s): %s"
+                        % (host, path, result.returncode, result.stderr.decode(errors="replace").strip()[-1500:])
+                    )

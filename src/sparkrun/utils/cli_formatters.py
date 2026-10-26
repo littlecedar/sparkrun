@@ -1121,6 +1121,47 @@ def _format_cache_report(report, action: str, now: float | None, show_untracked:
     return lines
 
 
+_CLAIM_ACTION_LABELS = {"would_release": "would release", "released": "released", "failed": "release failed"}
+
+
+def format_claim_reconciliation(results, *, dry_run: bool, now: float | None = None) -> str:
+    """Render ``model-cache reconcile`` (MODEL or --all): one row per outstanding claim, then a summary."""
+    if not results:
+        return "No outstanding workload claims."
+    header = ("REPO", "REVISION", "CLAIM", "WORKLOAD", "HOSTS", "CREATED", "STATUS")
+    rows = []
+    for r in sorted(results, key=lambda r: (r.repo, r.revision, r.created or 0, r.claim)):
+        status = r.reason if r.action is None else "%s (%s)" % (_CLAIM_ACTION_LABELS.get(r.action, r.action), r.reason)
+        rows.append((r.repo, r.revision[:12], r.claim, r.workload or "-", ",".join(r.hosts) or "-", format_age(r.created, now=now), status))
+    lines = _columns(header, rows)
+    count = {action: sum(1 for r in results if r.action == action) for action in _CLAIM_ACTION_LABELS}
+    kept = sum(1 for r in results if r.action is None)
+    lines.append("")
+    if dry_run:
+        lines.append("Would release %d orphaned claim(s); %d kept." % (count["would_release"], kept))
+        if count["would_release"]:
+            lines.append("Dry run: nothing was released. Re-run with --apply to release the claims marked above.")
+    else:
+        failed = " %d could not be released." % count["failed"] if count["failed"] else ""
+        lines.append("Released %d orphaned claim(s); %d kept.%s" % (count["released"], kept, failed))
+    return "\n".join(lines)
+
+
+def _claim_hint(repos: list[str], *, force: bool) -> str:
+    """Where to go when a claim protects a revision nothing seems to be using."""
+    from sparkrun.core.application_profile import render_identity_text
+
+    target = repos[0] if len(repos) == 1 else "--all"
+    hint = (
+        "Workload claims protect revisions a workload may still use; `{app_command} stop` releases them.\n"
+        "If nothing is running, find and release orphaned claims with `{app_command} model-cache reconcile %s`"
+        " (a preview; add --apply)." % target
+    )
+    if force:
+        hint += "\nOr pass --force to delete claimed revisions anyway."
+    return render_identity_text(hint)
+
+
 def format_model_cache_reports(reports, *, action: str = "inventory", now: float | None = None, show_untracked: bool = False) -> str:
     """Render ``CacheReport`` results from ``model-cache list/prune/pin/reconcile``.
 
@@ -1132,6 +1173,9 @@ def format_model_cache_reports(reports, *, action: str = "inventory", now: float
     if not reports:
         return "No cache hosts reported."
     blocks = ["\n".join(_format_cache_report(r, action, now, show_untracked)) for r in reports]
+    claimed = sorted({e.repo for r in reports for e in r.entries if e.claims and e.action not in ("would_delete", "deleted")})
+    if claimed and action in ("inventory", "delete"):
+        blocks.append(_claim_hint(claimed, force=action == "delete"))
     if action == "prune" and any(e.action == "would_remove" for r in reports for e in r.entries):
         blocks.append("Dry run: nothing was removed. Re-run with --apply to remove the revisions marked above.")
     if action == "adopt" and any(e.action == "would_adopt" for r in reports for e in r.entries):

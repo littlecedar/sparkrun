@@ -116,9 +116,9 @@ def search_recipes(
             directory.  They carry no registry and are listed first, so a
             local override is easy to spot.  Ignored when a registry filter
             is in effect, since a local recipe belongs to no registry.
-        unique_names: Collapse to one entry per unqualified name (first match
-            wins, working-directory recipes first) — the view in which typing
-            a bare recipe name is unambiguous, as ``sparkrun list`` shows it.
+        unique_names: Collapse to one entry per unscoped catalog name (first
+            match wins, working-directory recipes first). Disambiguated path
+            variants remain distinct choices, as ``sparkrun list`` shows them.
             The default keeps every copy, so a catalog browser can show
             ``@atlas/foo`` and ``@eugr/foo`` — or two same-stem variants
             within one registry — side by side.
@@ -137,7 +137,7 @@ def search_recipes(
             query scope) is unknown, disabled, or self-contradictory.
     """
     from sparkrun.api._context import resolve_sctx
-    from sparkrun.core.recipe import discover_cwd_recipes, filter_recipes, recipe_matches_query, recipe_summary
+    from sparkrun.core.recipe import discover_cwd_recipes, filter_recipes, recipe_listing_key, recipe_matches_query, recipe_summary
 
     sctx = resolve_sctx(sctx)
     registry_mgr = sctx.registry_manager
@@ -156,13 +156,9 @@ def search_recipes(
         query, registry, registry_mgr, include_hidden=include_hidden, allow_discovery=ensure_initialized
     )
 
-    # Drop entries that are literally the same file reached twice (shared
-    # clones are symlinked per registry).  Deliberately keyed on path, not on
-    # the qualified name: a registry's recipe dir is scanned with rglob, so
-    # sibling directories can hold same-stem variants of a recipe
-    # (``3x-spark-cluster/foo.yaml`` and ``4x-spark-cluster/foo.yaml``) that
-    # share a qualified name while being different recipes.  Collapsing those
-    # is `unique_names`' job, not this one.
+    # Drop repeated paths while keeping distinct files, including same-stem
+    # variants in different directories. The registry has already named those
+    # against its full inventory, before search or runtime filtering.
     entries = _dedupe(entries, key=lambda e: str(e.get("path", "")))
 
     local: list[dict] = []
@@ -174,7 +170,7 @@ def search_recipes(
 
     entries = local + entries
     if unique_names:
-        entries = _dedupe(entries, key=lambda e: str(e.get("file", "")))
+        entries = _dedupe(entries, key=recipe_listing_key)
 
     entries = filter_recipes(entries, runtime=runtime, registry=registry)
     return [RecipeSummary.from_summary(e) for e in entries]

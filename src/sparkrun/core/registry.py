@@ -12,6 +12,7 @@ from sparkrun.core.application_profile import remote_cache_path
 from sparkrun.core.config import resolve_sparkrun_cache_dir
 
 import logging
+from collections import Counter
 from copy import deepcopy
 import os
 import re
@@ -317,6 +318,17 @@ def _in_hidden_dir(path: Path, base: Path) -> bool:
     internals as recipes. Nothing launchable lives in a hidden directory.
     """
     return any(part.startswith(".") for part in path.relative_to(base).parts[:-1])
+
+
+def recipe_catalog_names(directory: Path, paths: Sequence[Path]) -> dict[Path, str]:
+    """Name a native registry's complete inventory, before filtering.
+
+    ``paths`` comes from ``iter_asset_files`` so extension precedence already
+    matches lookup. Only colliding stems need their full relative path. This
+    pass does no I/O and preserves the resolver's short name for a root file.
+    """
+    counts = Counter(path.stem for path in paths)
+    return {path: path.relative_to(directory).with_suffix("").as_posix() if counts[path.stem] > 1 else path.stem for path in paths}
 
 
 def _scan_asset_dir(
@@ -2888,11 +2900,36 @@ class RegistryManager:
             return recipes
 
         recipes = []
-        for f in iter_asset_files(recipe_dir, RECIPE_ASSET):
+        paths = iter_asset_files(recipe_dir, RECIPE_ASSET)
+        names = recipe_catalog_names(recipe_dir, paths)
+        for f in paths:
             summary = recipe_summary(f, registry_name=registry_name)
             if summary is not None:
+                summary["name"] = "@%s/%s" % (registry_name, names[f])
                 recipes.append(summary)
         return recipes
+
+    def catalog_recipe_name(self, entry: RegistryEntry, path: Path) -> str:
+        """Use catalog naming for a selected file, without loading recipe YAML.
+
+        The caller supplies the authoritative registry entry, avoiding another
+        inventory lookup or discovery. Canonical source paths and cache aliases
+        share the same naming policy. No persistent index needs invalidation.
+        """
+        base = self._recipe_dir(entry)
+        if base is None:
+            return "@%s/%s" % (entry.name, path.stem)
+        if not path.is_relative_to(base):
+            base, path = base.resolve(), path.resolve()
+        if not path.is_relative_to(base):
+            return "@%s/%s" % (entry.name, path.stem)
+        if is_foreign_format(entry.format):
+            handler, _why = entry_recipe_format(entry)
+            name = handler.name_of(path, base) if handler else path.stem
+        else:
+            names = recipe_catalog_names(base, iter_asset_files(base, RECIPE_ASSET))
+            name = names.get(path, path.relative_to(base).with_suffix("").as_posix())
+        return "@%s/%s" % (entry.name, name)
 
     def list_foreign_format_recipes(self, include_hidden: bool = False) -> list[dict[str, Any]]:
         """Summaries from every foreign-format registry (the ones :meth:`get_recipe_paths` leaves out)."""

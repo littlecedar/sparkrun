@@ -2928,6 +2928,12 @@ def recipe_summary_from_data(data: dict[str, Any], path: Path, *, name: str, reg
     """
     stem = name
     defaults = data.get("defaults", {})
+    # Match Recipe's metadata fallback, including descriptions inherited from
+    # a sibling include, without constructing or resolving a full recipe.
+    description = data.get("description") or ""
+    metadata = data.get("metadata")
+    if not description and isinstance(metadata, dict):
+        description = str(metadata.get("description") or "")
     qualified = ("@%s/%s" % (registry_name, stem)) if registry_name else stem
     try:
         builder = resolve_builder(data)
@@ -2940,7 +2946,7 @@ def recipe_summary_from_data(data: dict[str, Any], path: Path, *, name: str, reg
         "file": stem,
         "path": str(path),
         "model": data.get("model", ""),
-        "description": data.get("description", ""),
+        "description": description,
         "runtime": runtime,
         "min_nodes": data.get("min_nodes", 1),
         "tp": defaults.get("tensor_parallel", "") if isinstance(defaults, dict) else "",
@@ -2965,16 +2971,20 @@ def list_recipes(
     recipes: list[dict[str, Any]] = []
     seen_names: set[str] = set()
 
+    def add(entry: dict[str, Any] | None) -> None:
+        if entry is not None:
+            key = recipe_listing_key(entry)
+            if key not in seen_names:
+                seen_names.add(key)
+                recipes.append(entry)
+
     # Process CWD-discovered local files first (no registry label)
     for f in local_files or []:
-        if f.stem in seen_names:
-            continue
-        seen_names.add(f.stem)
-        entry = recipe_summary(f)
-        if entry is not None:
-            recipes.append(entry)
+        add(recipe_summary(f))
 
     all_paths = list(search_paths or [])
+    inventory = registry_manager.list_registries() if registry_manager else []
+    registry_recipes: dict[str, list[dict[str, Any]]] = {}
 
     # Add registry paths if available
     if registry_manager:
@@ -2985,31 +2995,50 @@ def list_recipes(
             continue
 
         # Determine if this is a registry path
-        registry_name = None
+        registry_entry = None
+        registry_path = None
         if registry_manager:
-            for reg in registry_manager.list_registries():
+            for reg in inventory:
                 if reg.enabled:
                     reg_path = resolve_registry_subpath(registry_manager.cache_root / reg.name, reg.subpath)
                     if reg_path is not None and (search_dir == reg_path or search_dir.is_relative_to(reg_path)):
-                        registry_name = reg.name
+                        registry_entry, registry_path = reg, reg_path
                         break
 
-        for f in iter_asset_files(search_dir, RECIPE_ASSET):
-            if f.stem not in seen_names:
-                seen_names.add(f.stem)
-                entry = recipe_summary(f, registry_name=registry_name)
-                if entry is not None:
-                    recipes.append(entry)
+        if registry_manager and registry_entry and registry_path:
+            # Name against the complete registry even when the caller asks for
+            # one subtree. Reuse its summaries if the full root also follows.
+            if registry_entry.name not in registry_recipes:
+                registry_recipes[registry_entry.name] = registry_manager._list_dir_recipes(
+                    registry_path, registry_entry.name, registry_entry
+                )
+            for entry in registry_recipes[registry_entry.name]:
+                if Path(entry["path"]).is_relative_to(search_dir):
+                    add(entry)
+        else:
+            for f in iter_asset_files(search_dir, RECIPE_ASSET):
+                add(recipe_summary(f))
 
     # Foreign-format registries are not in get_recipe_paths (their files are
     # not sparkrun YAML); list them through their format.
     if registry_manager:
         for entry in registry_manager.list_foreign_format_recipes(include_hidden=include_hidden):
-            if entry["file"] not in seen_names:
-                seen_names.add(entry["file"])
-                recipes.append(entry)
+            add(entry)
 
     return recipes
+
+
+def recipe_listing_key(entry: dict[str, Any]) -> str:
+    """Unscoped catalog name for first-match listing and completion.
+
+    Ordinary short names retain local/registry precedence. Path-qualified
+    variants are separate choices even though their ``file`` stems match.
+    """
+    name = str(entry.get("name", ""))
+    prefix = "@%s/" % entry.get("registry")
+    if entry.get("registry") and name.startswith(prefix):
+        return name[len(prefix) :]
+    return str(entry.get("file", ""))
 
 
 #: Recipe summary fields a free-text query is matched against.

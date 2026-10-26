@@ -143,9 +143,21 @@ def stop(
                 "Stop discovery does not cover the requested executor destination and hosts; refresh status before teardown."
             )
 
+    # A same-id relaunch keeps the earlier launch's model cache claims, and the
+    # scheduler may have placed it elsewhere, so the record can claim hosts the
+    # latest launch never touched.  Tearing the id down there too is what lets
+    # those claims be released; on a host where nothing runs it is a no-op.
+    # Hosts of the latest launch stay the caller's to scope (eviction stops a
+    # subset on purpose), so only hosts nothing but an earlier launch names.
+    claim_hosts = sorted(
+        {ref["host"] for ref in (meta or {}).get("model_cache_claims") or () if isinstance(ref, dict) and isinstance(ref.get("host"), str)}
+        - set((meta or {}).get("hosts") or ())
+        - set(target_hosts)
+    )
+
     if dry_run:
-        logger.info("Dry run: would stop %s on %s", cluster_id, ", ".join(target_hosts))
-        return StopResult(workload_id=cluster_id, hosts_targeted=tuple(target_hosts), containers_removed=0, dry_run=True)
+        logger.info("Dry run: would stop %s on %s", cluster_id, ", ".join([*target_hosts, *claim_hosts]))
+        return StopResult(workload_id=cluster_id, hosts_targeted=(*target_hosts, *claim_hosts), containers_removed=0, dry_run=True)
 
     try:
         native_removed = executor.stop_workload(cluster_id, metadata=meta)
@@ -160,6 +172,7 @@ def stop(
             errors=(str(exc),),
             hosts_failed=tuple(target_hosts),
         )
+    warnings: list[str] = []
     if native_removed is None:
         removed_count, hosts_failed, errors = _stop_containers(
             cluster_id,
@@ -169,8 +182,26 @@ def stop(
             sctx,
             discovered=discovered,
         )
+        claim_confirmed: list[str] = []
+        if claim_hosts:
+            # Discovery is not required here (and may not cover these hosts):
+            # candidate names are removed and verified gone.  An unconfirmed
+            # host only keeps its claims, so it warns rather than failing a
+            # stop the workload's own hosts confirmed.
+            extra_removed, extra_failed, extra_errors = _stop_containers(
+                cluster_id,
+                claim_hosts,
+                cluster_def,
+                executor,
+                sctx,
+                node_count=len(target_hosts) + len(claim_hosts),
+            )
+            removed_count += extra_removed
+            claim_confirmed = [host for host in claim_hosts if host not in extra_failed]
+            warnings.extend(extra_errors)
     else:
         removed_count, hosts_failed, errors = native_removed, (), []
+        claim_confirmed = list(claim_hosts)
 
     # Cleanup persistent metadata only once teardown is confirmed
     # everywhere: while a container survives, the metadata still describes
@@ -186,27 +217,45 @@ def stop(
             from sparkrun.orchestration.workload_cleanup import finalize_workload
             from sparkrun.orchestration.primitives import build_ssh_kwargs
 
-            finalize_workload(cluster_id, hosts=target_hosts, cache_dir=cache_dir, ssh_kwargs=build_ssh_kwargs(sctx.config))
+            # False also means "kept for hosts this stop was scoped away
+            # from", which is the caller's choice and needs no warning.
+            finalize_workload(
+                cluster_id, hosts=[*target_hosts, *claim_confirmed], cache_dir=cache_dir, ssh_kwargs=build_ssh_kwargs(sctx.config)
+            )
+            unreleased = sorted(set(claim_hosts) - set(claim_confirmed))
         except Exception:
             logger.warning(
                 "Could not release model cache claims or remove job metadata for %s; retry stop to reconcile", cluster_id, exc_info=True
             )
+            unreleased = [*target_hosts, *claim_hosts]
+        if unreleased:
+            from sparkrun.core.application_profile import render_identity_text
+
+            # The workload is stopped, but a claim it still holds protects
+            # its model revision from pruning until something releases it.
+            warnings.append(
+                render_identity_text(
+                    "Model cache claims of %s may remain on %s and its job record was kept; retry stop, or run "
+                    "'{app_command} model-cache reconcile --all' once those hosts are reachable." % (cluster_id, ", ".join(unreleased))
+                )
+            )
 
     return StopResult(
         workload_id=cluster_id,
-        hosts_targeted=tuple(target_hosts),
+        hosts_targeted=(*target_hosts, *claim_hosts),
         containers_removed=removed_count,
         errors=tuple(errors),
         hosts_failed=hosts_failed,
+        warnings=tuple(warnings),
     )
 
 
-def _stop_containers(cluster_id, target_hosts, cluster_def, executor, sctx, *, discovered=None):
+def _stop_containers(cluster_id, target_hosts, cluster_def, executor, sctx, *, discovered=None, node_count=None):
     from sparkrun.api._resolve import scope_operation
     from sparkrun.orchestration.teardown import parse_teardown_removed
 
     if discovered is None:
-        container_names = executor.enumerate_containers(cluster_id, len(target_hosts))
+        container_names = executor.enumerate_containers(cluster_id, node_count or len(target_hosts))
         host_containers = {host: list(container_names) for host in target_hosts}
     else:
         host_containers = _observed_container_names(cluster_id, target_hosts, executor.executor_name, discovered)

@@ -68,6 +68,28 @@ class TestCheckJobRunning:
         assert status.cluster_id == cid
         assert status.container_statuses["sparkrun_aabbccdd0011_solo"] is True
 
+    def test_check_running_passes_the_cluster_hardware_inventory(self):
+        """The status query carries the caller's saved inventory, as
+        ``api.status`` does; without it the executor falls back to
+        ``resolve_hardware()``, which raises under ``require-metadata``."""
+        cid = "sparkrun_aabbccdd0011"
+        hosts = ["10.0.0.1"]
+        inventory = {"10.0.0.1": object()}
+        with (
+            mock.patch(
+                "sparkrun.orchestration.executor.resolve_executor",
+                return_value=_executor(),
+            ) as mock_resolve,
+            mock.patch(
+                "sparkrun.orchestration.job_metadata.load_job_metadata",
+                return_value={"recipe": "test", "hosts": hosts},
+            ),
+        ):
+            mock_resolve.return_value.query_status.return_value = _status_running(cid, hosts)
+            status = check_job_running(cluster_id=cid, hosts=hosts, host_hardware=inventory)
+        assert status.running is True
+        assert mock_resolve.return_value.query_status.call_args.kwargs["host_hardware"] is inventory
+
     def test_check_running_solo_down(self):
         """Solo container not running."""
         cid = "sparkrun_aabbccdd0011"

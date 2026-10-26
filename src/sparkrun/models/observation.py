@@ -2,8 +2,36 @@
 
 from __future__ import annotations
 
+import json
+
 from sparkrun.models.artifacts import CacheValidationReport, ModelArtifactManifest, ModelFileFailure
 from sparkrun.utils.shell import quote
+
+
+def local_model_probe_script(path: str, model_format: str = "auto") -> str:
+    """Read-only host checks and transient file selection, without a manifest."""
+    from sparkrun.scripts import read_script
+
+    payload = json.dumps([path, "", "", "", model_format, True])
+    return "python3 - %s <<'SPARKRUN_LOCAL_MODEL'\n%s\nSPARKRUN_LOCAL_MODEL\n" % (
+        quote(payload),
+        read_script("resolve_model_path.py"),
+    )
+
+
+def local_model_access_script(path: str, files: list[str]) -> str:
+    """Check host-selected files through workload mounts without Python there."""
+    return (
+        "set -eu\nmodel=" + quote(path) + "\n"
+        'if [ ! -e "$model" ]; then echo "missing local model: $model" >&2; exit 1; fi\n'
+        'if [ -d "$model" ] && { [ ! -r "$model" ] || [ ! -x "$model" ]; }; then\n'
+        '  echo "unreadable local model directory: $model" >&2; exit 1\nfi\n'
+        "files=(" + " ".join(quote(file) for file in files) + ")\n"
+        'for p in "${files[@]}"; do\n'
+        '  if [ ! -f "$p" ]; then echo "missing or non-regular model file: $p" >&2; exit 1; fi\n'
+        '  if ! { : < "$p"; } 2>/dev/null; then echo "unreadable model file: $p" >&2; exit 1; fi\n'
+        "done\n"
+    )
 
 
 def path_assignment(name: str, path: str) -> str:
