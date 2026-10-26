@@ -10,6 +10,12 @@ first tagged release containing them, regardless of their original commit date.
 
 ## [Unreleased]
 
+### Fixed
+
+- Quitting `cluster monitor` no longer risks a `NoMatches: '#host-table'` traceback: a
+  refresh tick landing after Textual had pruned the screens, but before it closed the
+  timers, queried the removed table.
+
 ## [0.4.2] — 2026-10-25
 
 ### Added
