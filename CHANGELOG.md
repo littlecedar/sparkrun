@@ -10,6 +10,8 @@ first tagged release containing them, regardless of their original commit date.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-10-25
+
 ### Added
 
 - The `cluster monitor` recipe picker groups runtime variants into families (such
@@ -1328,7 +1330,8 @@ the post-launch lifecycle are unchanged for existing recipes.
 
 [0.3.0]: https://github.com/spark-arena/sparkrun/releases/tag/v0.3.0
 
-[Unreleased]: https://github.com/spark-arena/sparkrun/compare/v0.4.1...develop-next
+[Unreleased]: https://github.com/spark-arena/sparkrun/compare/v0.4.2...develop-next
+[0.4.2]: https://github.com/spark-arena/sparkrun/releases/tag/v0.4.2
 [0.4.1]: https://github.com/spark-arena/sparkrun/releases/tag/v0.4.1
 [0.3.1]: https://github.com/spark-arena/sparkrun/releases/tag/v0.3.1
 [0.3.2]: https://github.com/spark-arena/sparkrun/releases/tag/v0.3.2
