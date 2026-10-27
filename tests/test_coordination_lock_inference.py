@@ -103,3 +103,149 @@ def test_plan_locks_candidate_hosts_not_just_the_chosen_host_list(tmp_path: Path
     assert decorated(plan=plan, sctx=sctx) == "ok"
 
     assert captured["keys"] == reservation_keys(("cand1", "cand2", "cand3"))
+
+
+def test_release_reservations_frees_hosts_while_the_operation_continues(tmp_path: Path):
+    """A long non-mutating tail (foreground proxy supervision) must not keep
+    the hosts its startup reserved: another launch on them has to succeed."""
+    from sparkrun.core.coordination import release_reservations, reservations, reserve_resources
+
+    keys = reservation_keys(["h1", "h2"])
+    with reserve_resources(tmp_path, keys):
+        assert {row["resource"] for row in reservations(tmp_path)} == keys
+        release_reservations()
+        assert reservations(tmp_path) == []
+        # Released for this context too: a nested reservation really claims.
+        with reserve_resources(tmp_path, reservation_keys(["h1"])):
+            assert [row["resource"] for row in reservations(tmp_path)] == ["host:h1"]
+        assert reservations(tmp_path) == []
+    assert reservations(tmp_path) == []
+
+
+def _hold_in_thread(root, keys, seconds):
+    import threading
+
+    from sparkrun.core.coordination import reserve_resources
+
+    held = threading.Event()
+
+    def holder():
+        with reserve_resources(root, keys):
+            held.set()
+            threading.Event().wait(seconds)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert held.wait(10)
+    return thread
+
+
+def test_busy_error_names_a_live_holder_and_its_command(tmp_path: Path):
+    import pytest
+
+    from sparkrun.core.coordination import ResourceBusy, reserve_resources
+
+    thread = _hold_in_thread(tmp_path, reservation_keys(["h1", "h2"]), 1.0)
+    try:
+        with pytest.raises(ResourceBusy) as caught:
+            with reserve_resources(tmp_path, reservation_keys(["h2"])):
+                pass
+    finally:
+        thread.join()
+    message = str(caught.value)
+    assert "host:h2" in message and "host:h1" not in message  # only what conflicts
+    assert "running pid %d" % __import__("os").getpid() in message
+    assert "python" in message.lower()  # the holder's command line
+    assert "sparkrun daemon resources list" in message
+    assert [h["resource"] for h in caught.value.holders] == ["host:h2"]
+    assert caught.value.holders[0]["alive"] is True
+
+
+def test_busy_error_for_a_dead_owner_gives_the_reconcile_command(tmp_path: Path):
+    import json
+    import sqlite3
+
+    import pytest
+
+    from sparkrun.core.coordination import ResourceBusy, reserve_resources
+
+    with reserve_resources(tmp_path, {"host:other"}):
+        pass  # creates the table
+    db = sqlite3.connect(tmp_path / "operations.sqlite3", isolation_level=None)
+    db.execute(
+        "INSERT INTO reservations VALUES(?,?,?)", ("deadbeef", "host:h1", json.dumps({"pid": 2**22 + 7, "boot": "x", "created": "1"}))
+    )
+    db.close()
+    with pytest.raises(ResourceBusy) as caught:
+        with reserve_resources(tmp_path, reservation_keys(["h1"])):
+            pass
+    assert "sparkrun daemon resources reconcile deadbeef --acknowledge-effects" in str(caught.value)
+    assert caught.value.holders[0]["alive"] is False
+
+
+def test_brief_controller_hold_is_waited_out(tmp_path: Path):
+    from sparkrun.core.coordination import reservations, reserve_resources
+
+    thread = _hold_in_thread(tmp_path, {"*"}, 0.5)
+    try:
+        with reserve_resources(tmp_path, reservation_keys(["h1"]), wait=5):
+            assert [row["resource"] for row in reservations(tmp_path)] == ["host:h1"]
+    finally:
+        thread.join()
+
+
+def test_controller_hold_outlasting_the_wait_still_refuses(tmp_path: Path):
+    import time
+
+    import pytest
+
+    from sparkrun.core.coordination import ResourceBusy, reserve_resources
+
+    thread = _hold_in_thread(tmp_path, {"*"}, 2.0)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ResourceBusy, match=r"\*: held by running pid"):
+            with reserve_resources(tmp_path, reservation_keys(["h1"]), wait=0.3):
+                pass
+        assert time.monotonic() - started < 1.5
+    finally:
+        thread.join()
+
+
+def test_host_conflicts_are_not_retried(tmp_path: Path):
+    """Only `*` holds are brief; a host held by a launch is refused at once."""
+    import time
+
+    import pytest
+
+    from sparkrun.core.coordination import ResourceBusy, reserve_resources
+
+    thread = _hold_in_thread(tmp_path, reservation_keys(["h1"]), 1.0)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ResourceBusy):
+            with reserve_resources(tmp_path, reservation_keys(["h1"]), wait=5):
+                pass
+        assert time.monotonic() - started < 0.5
+    finally:
+        thread.join()
+
+
+def test_infer_reservation_hosts_resolves_named_then_default_cluster(tmp_path: Path):
+    """The daemon worker shares this with operation_boundary, so a flagless
+    daemon job locks the default cluster rather than every host ("*")."""
+    from sparkrun.core.coordination import infer_reservation_hosts
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({}))
+    config = SparkrunConfig(config_path=config_path)
+    mgr = ClusterManager(tmp_path)
+    mgr.create("named", ["n1"])
+    mgr.create("dflt", ["d1", "d2"])
+
+    assert not infer_reservation_hosts(config)[0]  # nothing configured: unknown, reserved as "*"
+    mgr.set_default("dflt")
+    hosts, cluster = infer_reservation_hosts(config)
+    assert list(hosts) == ["d1", "d2"] and cluster.name == "dflt"
+    hosts, cluster = infer_reservation_hosts(config, cluster="named")
+    assert list(hosts) == ["n1"]

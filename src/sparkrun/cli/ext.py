@@ -175,6 +175,16 @@ class PluggableGroup(click.Group):
         )
         return super().parse_args(ctx, args)
 
+    def invoke(self, ctx):
+        from sparkrun.core.coordination import ResourceBusy
+
+        try:
+            return super().invoke(ctx)
+        except ResourceBusy as exc:
+            # Contention is an answer (who holds what, and what to do), not a
+            # crash: no command renders it, and a traceback buried the holder.
+            raise click.ClickException(str(exc)) from exc
+
     def _main_shell_completion(self, *args, **kwargs):
         # Click owns the completion flag and enters this hook before building
         # contexts. Avoid loading an application profile merely to detect TAB.

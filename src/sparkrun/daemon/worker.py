@@ -248,14 +248,21 @@ class Worker:
                         raise InterruptedError("Cancelled before execution")
                 self.operation.check()
                 with operation_scope(sctx):
-                    from sparkrun.core.coordination import reserve_resources, reservation_keys
+                    from sparkrun.core.coordination import infer_reservation_hosts, reserve_resources, reservation_keys
 
                     # Composite adapters use the same reservation mechanism as CLI/API.
+                    # A launch or teardown naming no hosts locks the default cluster (or
+                    # the workload's recorded hosts), as the API call it wraps does.
+                    # Anything else keeps "*": catalog, cluster-definition and resume
+                    # jobs act on state the default cluster does not describe.
                     args = self.job["arguments"]
                     hosts = args.get("hosts")
-                    if not hosts and args.get("cluster"):
-                        hosts = sctx.cluster_manager.get(args["cluster"]).hosts
-                    keys = reservation_keys(hosts, executor_config=args.get("executor_config"), controller=op.resources == "controller")
+                    cluster = args.get("cluster")
+                    workload_id = args.get("workload_id") or args.get("cluster_id")
+                    if not hosts and (cluster or workload_id or args.get("recipe")):
+                        hosts, cluster = infer_reservation_hosts(config, cluster=cluster, workload_id=workload_id)
+                    executor_config = args.get("executor_config") or getattr(cluster, "executor_config", None)
+                    keys = reservation_keys(hosts, executor_config=executor_config, controller=op.resources == "controller")
                     if op.scope != "read" and op.resources != "none":
                         stack.enter_context(reserve_resources(config.config_path.parent, keys))
                     # Cleanup precedes releasing mutation reservations.

@@ -2202,6 +2202,15 @@ easily reused, and `kill(pid, 0)` would make the boot-started unit refuse to
 start and `proxy stop` signal a stranger. Records carry `boot_id`; one from
 another boot reads as not running. Records without it keep their old meaning.
 
+**Foreground supervision holds no host reservation.** `proxy start` runs under
+`operation_boundary(mutation=True)`, which for a flagless start reserves the
+default cluster's hosts in `operations.sqlite3`. `supervise_foreground` calls
+`coordination.release_reservations()` first: the start stays guarded, but a
+proxy supervised for days (the systemd unit) had refused every `run` on those
+hosts with `ResourceBusy`. The daemon backend releases before `wait_gateway`
+for the same reason. `proxy stop` reserves nothing (it touches no cluster
+host), or it would collide with the proxy it stops.
+
 **Restarts from outside the unit go through it** (`ProxyEngine._restart_proxy`).
 `proxy alias add`, `sync` and load/unload restart LiteLLM from the user's
 shell. Spawning the replacement there would put it outside the unit's cgroup
