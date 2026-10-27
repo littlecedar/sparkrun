@@ -251,16 +251,19 @@ class Worker:
                     from sparkrun.core.coordination import infer_reservation_hosts, reserve_resources, reservation_keys
 
                     # Composite adapters use the same reservation mechanism as CLI/API.
-                    # A launch or teardown naming no hosts locks the default cluster (or
-                    # the workload's recorded hosts), as the API call it wraps does.
-                    # Anything else keeps "*": catalog, cluster-definition and resume
-                    # jobs act on state the default cluster does not describe.
+                    # A launch, teardown or benchmark resume naming no hosts locks what
+                    # the API call it wraps locks: the default cluster, or the workload's
+                    # or benchmark's recorded hosts. Anything else keeps "*": catalog
+                    # and cluster-definition jobs act on state no host list describes.
                     args = self.job["arguments"]
                     hosts = args.get("hosts")
                     cluster = args.get("cluster")
                     workload_id = args.get("workload_id") or args.get("cluster_id")
-                    if not hosts and (cluster or workload_id or args.get("recipe")):
-                        hosts, cluster = infer_reservation_hosts(config, cluster=cluster, workload_id=workload_id)
+                    benchmark_id = args.get("benchmark_id")
+                    if not hosts and (cluster or workload_id or benchmark_id or args.get("recipe")):
+                        hosts, cluster = infer_reservation_hosts(
+                            config, cluster=cluster, workload_id=workload_id, benchmark_id=benchmark_id
+                        )
                     executor_config = args.get("executor_config") or getattr(cluster, "executor_config", None)
                     keys = reservation_keys(hosts, executor_config=executor_config, controller=op.resources == "controller")
                     if op.scope != "read" and op.resources != "none":

@@ -249,3 +249,45 @@ def test_infer_reservation_hosts_resolves_named_then_default_cluster(tmp_path: P
     assert list(hosts) == ["d1", "d2"] and cluster.name == "dflt"
     hosts, cluster = infer_reservation_hosts(config, cluster="named")
     assert list(hosts) == ["n1"]
+
+
+def test_resume_locks_the_benchmarks_recorded_hosts_not_the_default_cluster(tmp_path: Path, monkeypatch):
+    """A resume acts on the hosts its benchmark ran on, which need not be the
+    default cluster's: locking the default cluster left those hosts open."""
+    from sparkrun.benchmarking.run_state import BenchmarkRunState
+    from sparkrun.orchestration.job_metadata import generate_cluster_id
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({}))
+    config = SparkrunConfig(config_path=config_path)
+    mgr = ClusterManager(tmp_path)
+    mgr.create("dflt", ["d1", "d2"])
+    mgr.set_default("dflt")
+
+    cluster_id = generate_cluster_id("a" * 16, "b" * 12)
+    BenchmarkRunState(
+        benchmark_id="bench_resume_hosts",
+        cluster_id=cluster_id,
+        recipe_qualified_name="r",
+        framework="llama-benchy",
+        profile=None,
+        base_args={},
+        schedule=[],
+        host_list=["b1", "b2"],
+    ).save(str(config.cache_dir))
+    # The live launch (what resume reaches) was relaunched onto b3 as well.
+    monkeypatch.setattr(
+        "sparkrun.orchestration.job_metadata.load_job_metadata",
+        lambda cid, cache_dir=None: {"hosts": ["b1", "b3"]} if cid == cluster_id else None,
+    )
+
+    def resume(benchmark_id, *, dry_run=False, sctx=None):
+        return "ok"
+
+    captured = _capture_reserved_keys(monkeypatch)
+    assert operation_boundary(mutation=True)(resume)("bench_resume_hosts", sctx=SimpleNamespace(config=config)) == "ok"
+    assert captured["keys"] == reservation_keys(["b1", "b3", "b2"])
+
+    # Unknown state: nothing to go on, so everything is reserved.
+    operation_boundary(mutation=True)(resume)("bench_missing", sctx=SimpleNamespace(config=config))
+    assert captured["keys"] == {"*"}

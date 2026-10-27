@@ -23,6 +23,9 @@ first tagged release containing them, regardless of their original commit date.
 - A daemon launch or teardown naming no hosts reserves the default cluster's hosts (or
   the workload's recorded hosts), as the API call it wraps does, instead of every host on
   the controller. A job naming an unknown cluster no longer crashes the worker.
+- `benchmark resume` reserves the hosts its benchmark ran on (the live launch's and the
+  measured ones) instead of the default cluster's, which left those hosts open to a
+  concurrent launch when the benchmark ran on another cluster.
 - A launch colliding with a brief controller-wide hold (a client polling workload
   inventory) waits up to 3 seconds for it instead of failing at once.
 - Quitting `cluster monitor` no longer risks a `NoMatches: '#host-table'` traceback: a

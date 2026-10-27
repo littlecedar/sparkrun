@@ -217,13 +217,15 @@ def reservation_keys(hosts=None, *, executor_config=None, controller=False):
     return keys
 
 
-def infer_reservation_hosts(config, *, cluster=None, workload_id=None):
+def infer_reservation_hosts(config, *, cluster=None, workload_id=None, benchmark_id=None):
     """Hosts a call naming no hosts will act on, and the cluster they came from.
 
     Shared by API calls (``operation_boundary``) and daemon jobs, which must
     lock the same machines for the same request. Mirrors
     ``api._resolve.resolve_cluster``: named cluster → the job's recorded hosts
     → the default cluster (``cluster set-default``) → ``config.default_hosts``.
+    A ``benchmark_id`` (resume) is answered by the benchmark's recorded hosts,
+    which need not be the default cluster's; unknown state reserves ``*``.
     Skipping the default-cluster step locked ``default_hosts`` while the call
     tore down the default cluster's hosts: two concurrent mutations holding
     disjoint locks over the same machines. ``(None, cluster)`` means unknown,
@@ -237,6 +239,10 @@ def infer_reservation_hosts(config, *, cluster=None, workload_id=None):
             cluster = cluster_mgr.get(cluster)
         if cluster is not None:
             return cluster.hosts, cluster
+        if benchmark_id:
+            from sparkrun.benchmarking.run_state import recorded_benchmark_hosts
+
+            return recorded_benchmark_hosts(benchmark_id, str(config.cache_dir)), cluster
         if workload_id:
             from sparkrun.orchestration.job_metadata import load_job_metadata
 
@@ -289,6 +295,7 @@ def operation_boundary(*, mutation=False):
                         config,
                         cluster=cluster,
                         workload_id=bound.arguments.get("workload_id") or bound.arguments.get("cluster_id"),
+                        benchmark_id=bound.arguments.get("benchmark_id"),
                     )
                 # Host conflicts are deliberately independent of SSH usernames:
                 # different login users still mutate the same machine/devices.
