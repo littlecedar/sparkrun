@@ -150,6 +150,8 @@ class SglangRuntime(RuntimePlugin):
     all.  See :class:`_SglangTopology`.
     """
 
+    required_feature_flag = "runtime.sglang"
+
     gpu_utilization_key = "gpu_memory_utilization"
 
     runtime_name = "sglang"

@@ -103,6 +103,19 @@ def render_flag_value(value: Any) -> str:
     return str(value)
 
 
+#: Runtime name -> the feature flag that switched it off, recorded at registration.
+GATED_OFF_RUNTIMES: dict[str, str] = {}
+
+
+class RuntimeUnavailableError(ValueError):
+    """A recipe named a real runtime that a feature flag has switched off.
+
+    A ``ValueError`` like the unknown-runtime error, so existing handlers keep
+    working, but distinct so the message can name the flag instead of telling
+    the user their recipe is wrong.
+    """
+
+
 class RuntimePlugin(Plugin, ABC):
     """Abstract base class for sparkrun inference runtimes.
 
@@ -119,6 +132,12 @@ class RuntimePlugin(Plugin, ABC):
 
     # --- Subclass must define ---
     runtime_name: str = ""
+
+    #: Feature flag gating this runtime (``None`` = always available). A gated-off
+    #: runtime hides itself from ``get_extensions`` (:meth:`is_multi_extension`);
+    #: naming it raises :class:`RuntimeUnavailableError`. The same mechanism
+    #: executors, builders and transports use.
+    required_feature_flag: ClassVar[str | None] = None
     # Legacy image metadata. Default selection requires platform qualification;
     # runtime-owned images may override default_image_for with hardware checks.
     default_image_prefix: str = ""
@@ -229,7 +248,24 @@ class RuntimePlugin(Plugin, ABC):
         return False
 
     def is_multi_extension(self, v: Variables) -> bool:
+        # SAF exposes a multi-extension plugin through get_extensions only when
+        # this is True at registration, so a gated-off runtime stays registered
+        # but is absent from list_runtimes / get_runtime (see core.features).
+        if self.required_feature_flag:
+            from sparkrun.core.features import feature_gate_enabled
+
+            return feature_gate_enabled(self.required_feature_flag, v)
         return True
+
+    def on_registration(self, v: Variables) -> None:
+        # Recorded here, the one point where a gated-off runtime is still
+        # visible, so get_runtime can say "disabled" rather than "unknown".
+        if not self.runtime_name:
+            return
+        if self.required_feature_flag and not self.is_multi_extension(v):
+            GATED_OFF_RUNTIMES[self.runtime_name] = self.required_feature_flag
+        else:
+            GATED_OFF_RUNTIMES.pop(self.runtime_name, None)
 
     def initialize(self, v: Variables, logger: Logger) -> RuntimePlugin:
         return self

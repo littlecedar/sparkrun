@@ -1798,8 +1798,13 @@ def validate_recipe(
     issues.extend(_safe("recipe-metadata", lambda: [RecipeIssue(SUGGESTION, "recipe-metadata", m) for m in recipe.validate_metadata()]))
 
     if runtime is None:
+        from sparkrun.runtimes.base import RuntimeUnavailableError
+
         try:
             runtime = get_runtime(recipe.runtime, v)
+        except RuntimeUnavailableError as e:
+            # The recipe is fine; this install has the engine switched off.
+            issues.append(RecipeIssue(ERROR, "runtime-disabled", str(e)))
         except ValueError:
             issues.append(RecipeIssue(ERROR, "unknown-runtime", "Unknown runtime: %s" % recipe.runtime))
 

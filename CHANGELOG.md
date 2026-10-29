@@ -10,6 +10,15 @@ first tagged release containing them, regardless of their original commit date.
 
 ## [Unreleased]
 
+### Changed
+
+- Every runtime now has a feature flag (`runtime.vllm`, `runtime.sglang`,
+  `runtime.llama_cpp`, `runtime.trtllm`, `runtime.atlas`, `runtime.modular_max`,
+  `runtime.tokenary`), so an install can switch off engines it does not support. All
+  are on by default except **`runtime.tokenary`, which is now off**: enable it with
+  `sparkrun setup features enable runtime.tokenary` to keep running tokenary recipes.
+  A disabled runtime is reported as disabled, with the flag to enable, not as unknown.
+
 ### Fixed
 
 - Two launches with a low `--gpu-mem` (e.g. 0.3) can share one GPU again under the

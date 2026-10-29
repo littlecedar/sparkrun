@@ -3372,6 +3372,19 @@ hard-codes `"docker"` when no layer names an executor — `_default_executor_nam
 returns docker when enabled, else the sole enabled executor, else raises "name
 one / set `default_executor`" (never silently runs on a disabled backend).
 
+**Runtime gates (`runtime.*`)**: every in-tree runtime declares
+`RuntimePlugin.required_feature_flag`, one flag per engine family
+(`runtime.vllm` covers vllm-ray, vllm-distributed and eugr-vllm; then
+`runtime.sglang`, `.llama_cpp`, `.trtllm`, `.atlas`, `.modular_max`,
+`.tokenary`). All default on, on every channel, except `runtime.tokenary`
+(experimental, off everywhere). A gated-off runtime hides itself through
+`is_multi_extension` and is recorded in `runtimes.base.GATED_OFF_RUNTIMES` at
+registration, so `get_runtime` raises `RuntimeUnavailableError` (a
+`ValueError`, naming the flag) rather than "Unknown runtime", and `recipe
+validate` reports `runtime-disabled`, not `unknown-runtime`: the recipe is
+fine, the install has the engine switched off. Tests that resolve tokenary
+through the registry must enable it (subprocess, as in `TestRuntimeGates`).
+
 **Gateway gates**: see Inference Gateway above for the defaults (stated once
 there). Exclusivity ("one gateway at a time") is arbitrated at *resolution*, not
 by the flag registry.

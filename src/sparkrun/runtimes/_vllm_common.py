@@ -20,6 +20,8 @@ class VllmRuntimeBase(RuntimePlugin):
     that are identical between vllm-ray and vllm-distributed.
     """
 
+    required_feature_flag = "runtime.vllm"
+
     gpu_utilization_key = "gpu_memory_utilization"
 
     def declared_kv_cache_memory_bytes(self, recipe, overrides=None):

@@ -98,6 +98,8 @@ class LlamaCppRuntime(RuntimePlugin):
     They cannot be used simultaneously.
     """
 
+    required_feature_flag = "runtime.llama_cpp"
+
     runtime_name = "llama-cpp"
     default_image_prefix = "scitrera/dgx-spark-llama-cpp"
 

@@ -76,6 +76,8 @@ class TrtllmRuntime(RuntimePlugin):
     pattern inherited from the base class.
     """
 
+    required_feature_flag = "runtime.trtllm"
+
     runtime_name = "trtllm"
     default_image_prefix = "nvcr.io/nvidia/tensorrt-llm/release"
     # mpirun starts every rank from the head with one environment.
