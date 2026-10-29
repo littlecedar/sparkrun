@@ -8,7 +8,7 @@ import re
 import shlex
 from abc import ABC, abstractmethod
 from logging import Logger
-from typing import Any, Mapping, TYPE_CHECKING
+from typing import Any, ClassVar, Mapping, TYPE_CHECKING
 
 from scitrera_app_framework import Plugin, Variables, ext_parse_bool
 
@@ -913,6 +913,108 @@ class RuntimePlugin(Plugin, ABC):
         matching the discipline on :meth:`known_config_keys`.
         """
         return None
+
+    #: Config key holding this engine's per-accelerator memory fraction, for
+    #: engines whose setting bounds *total* device memory (vLLM's
+    #: ``gpu_memory_utilization``). Setting it opts the runtime into
+    #: :meth:`declared_gpu_utilization`'s shared reading; ``None`` declares none.
+    gpu_utilization_key: ClassVar[str | None] = None
+
+    def engine_setting(
+        self,
+        recipe: Recipe,
+        overrides: Mapping[str, Any] | None,
+        key: str,
+        flags: tuple[str, ...] | None = None,
+        *,
+        required: bool = False,
+    ) -> Any:
+        """The value of *key* the engine will actually be given, or ``None``.
+
+        Without a ``command:`` template the serve command is built from the
+        config chain, so the chain's value is what runs. A template is
+        rendered verbatim and nothing is appended for unreferenced keys, so
+        there the template decides: its flag's literal, or the placeholder it
+        names resolved through the chain; a template without the flag leaves
+        the engine's own default (``None`` here), whatever ``-o`` says.
+
+        *flags* default to this runtime's serve flag for *key*; the last
+        occurrence wins, as in argparse. An unresolvable placeholder is
+        ``None``, or raises ``ValueError`` when *required*.
+        """
+        from sparkrun.utils.command_flags import command_flag_value
+
+        config = recipe.build_config_chain(dict(overrides or {}))
+        if not recipe.command:
+            return config.get(key)
+        if flags is None:
+            flag = (self.serve_flag_map() or {}).get(key)
+            flags = (flag,) if flag else ()
+        raw = command_flag_value(recipe.command, *flags, literal_only=False) if flags else None
+        if isinstance(raw, str) and raw.startswith("{") and raw.endswith("}"):
+            raw = config.get(raw[1:-1])
+            if raw is None and required:
+                raise ValueError("Unresolved %s command parameter" % key)
+        return raw
+
+    def declared_gpu_utilization(self, recipe: Recipe, overrides: Mapping[str, Any] | None = None) -> float | None:
+        """The memory fraction this launch tells the engine, or ``None`` when unset or unknown.
+
+        :attr:`gpu_utilization_key` as the engine receives it
+        (:meth:`engine_setting`). ``None`` for a runtime that declares no key,
+        a value outside (0, 1], or a template that leaves it to the engine's
+        own default; a non-numeric config value raises. The VRAM estimate's
+        runtime budget; :meth:`scheduler_gpu_fraction` is the scheduling claim.
+        """
+        import math
+
+        from sparkrun.utils.data import float_setting
+
+        key = self.gpu_utilization_key
+        if key is None:
+            return None
+        value = self.engine_setting(recipe, overrides, key)
+        if value is None:
+            return None
+        try:
+            fraction = float_setting(value, key=key)
+        except ValueError:
+            if isinstance(value, str) and recipe.command:
+                return None  # an unparsable template literal says nothing usable
+            raise  # malformed config, as any setting does
+        if not math.isfinite(fraction) or not 0 < fraction <= 1:
+            return None
+        return fraction
+
+    def declared_kv_cache_memory_bytes(self, recipe: Recipe, overrides: Mapping[str, Any] | None = None) -> int | None:
+        """An explicit per-GPU KV allocation in bytes, or ``None`` when the engine sizes it itself.
+
+        For engines that accept a fixed KV budget (vLLM's
+        ``--kv-cache-memory-bytes``), which then replaces the fraction-based
+        sizing in the VRAM estimate. Default ``None``. An invalid budget
+        raises ``ValueError``, so planning fails rather than estimating.
+        """
+        return None
+
+    def scheduler_gpu_fraction(self, recipe: Recipe, overrides: Mapping[str, Any] | None = None) -> float:
+        """Fraction of each assigned accelerator this launch claims, in (0, 1].
+
+        The scheduler's ``ResourceRequest.util_fraction``: below
+        ``EXCLUSIVE_GPU_THRESHOLD`` (0.8) an occupancy scheduler may share the
+        GPU, at or above it the launch owns the GPU outright. One value for
+        every rank: engines apply a single fraction to each device.
+
+        :meth:`declared_gpu_utilization`, else ``1.0`` (exclusive): a runtime
+        that does not know how its engine bounds memory, or a malformed value,
+        never under-claims. A runtime whose engine expresses its claim
+        differently overrides this.
+        """
+        try:
+            declared = self.declared_gpu_utilization(recipe, overrides)
+        except ValueError:
+            logger.debug("Malformed %s; claiming the whole GPU", self.gpu_utilization_key, exc_info=True)
+            return 1.0
+        return declared if declared is not None else 1.0
 
     # noinspection PyUnusedLocal
     def world_size(

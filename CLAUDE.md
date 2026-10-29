@@ -491,6 +491,26 @@ spellings and substitutes with a function, never a regex replacement string.
 `supports_per_node_env` (trtllm refuses per-node env templates) and
 `replica_service_domains` (vLLM service domains in `api.materialize`).
 
+**Engine settings are the runtime's to read** (`RuntimePlugin.engine_setting`,
+`declared_gpu_utilization`, `scheduler_gpu_fraction`, `declared_kv_cache_memory_bytes`).
+A recipe consumes them through `Recipe.runtime_plugin()` rather than reading
+`defaults` itself, because what the engine receives depends on the runtime: a
+`command:` template is rendered verbatim with nothing appended, so there the
+template's flag (literal, or placeholder resolved through the chain) is the value,
+and a template without the flag leaves the engine's default whatever `-o` says.
+Reading `defaults` first would under-claim exactly when a template hardcodes a
+high fraction. `scheduler_gpu_fraction()` is the scheduler's `util_fraction` (default
+`1.0`, exclusive; below 0.8 the occupancy schedulers share the GPU and reserve
+fraction × capacity, #335); a runtime opts in with `gpu_utilization_key` and its
+serve flag map. No placement puts two ranks of one request on a GPU, shared or
+not: they form one NCCL world, which refuses two ranks on a device. The packers
+skip a GPU once it holds one of the request's ranks (and do not report it as a
+rejection: it is in use, not blocked); an explicit layout that repeats a GPU is
+refused as `same_request`. Packing replicas onto one GPU would be a configuration
+knob, not a runtime flag, if it is ever wanted. Literal flags in templates are read only through
+`utils/command_flags.command_flag_value` (whole token, last occurrence wins as
+in argparse).
+
 **Executor resolution** (`RuntimePlugin._resolve_executor`): runtimes do not
 construct executors directly. The base helper delegates to
 `orchestration.executor:resolve_executor()` — a single layered chain (CLI →

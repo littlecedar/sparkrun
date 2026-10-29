@@ -12,6 +12,15 @@ first tagged release containing them, regardless of their original commit date.
 
 ### Fixed
 
+- Two launches with a low `--gpu-mem` (e.g. 0.3) can share one GPU again under the
+  occupancy schedulers (#335). Every launch asked for, and recorded, an exclusive GPU,
+  so the second was refused with "exclusive ownership prevents sharing". A launch now
+  claims its runtime's memory fraction (`RuntimePlugin.scheduler_gpu_fraction`); 0.8
+  and above, or unset, still reserves whole GPUs. Each rank of a launch gets its own
+  GPU, shared or not. A workload started before this fix keeps its exclusive record
+  until relaunched. `recipe show` reports shared vs exclusive. `greedy` is unaffected.
+- The fit report and explicit KV budget read what the engine actually receives: with
+  a `command:` template, the flag it renders, not a `defaults` value it never passes.
 - A running `proxy start --foreground` (including the `proxy systemd` unit) no longer
   refuses every `sparkrun run` on the cluster with `ResourceBusy`. Its startup reserved
   the default cluster's hosts and held them for the proxy's whole life; the reservation

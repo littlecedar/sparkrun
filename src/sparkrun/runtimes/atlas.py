@@ -272,6 +272,8 @@ class AtlasRuntime(RuntimePlugin):
     rank 0 exposes the OpenAI API.
     """
 
+    gpu_utilization_key = "gpu_memory_utilization"
+
     runtime_name = "atlas"
     default_image_prefix = "azeezish/atlas-gb10"
 

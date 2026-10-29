@@ -150,6 +150,8 @@ class SglangRuntime(RuntimePlugin):
     all.  See :class:`_SglangTopology`.
     """
 
+    gpu_utilization_key = "gpu_memory_utilization"
+
     runtime_name = "sglang"
     default_image_prefix = "scitrera/dgx-spark-sglang"
     readiness_styles = (OPENAI_CHAT_STREAM,)
